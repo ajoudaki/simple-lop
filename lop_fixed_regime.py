@@ -11,9 +11,175 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.init as init
+from torch.optim.optimizer import Optimizer
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# START: CORRECTED Muon Optimizer Implementation
+# (Based on arXiv:2502.16982v1)
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+class Muon(Optimizer):
+    """
+    Implements the SCALABLE Muon optimizer as described in arXiv:2502.16982v1.
+
+    This is a hybrid optimizer:
+    - Applies Muon-P logic (Eq. 2 & 4) to 2D matrix parameters (e.g., weights).
+    - Applies AdamW logic to all other parameters (e.g., biases, 1D vectors).
+    """
+
+    def __init__(self, params, lr=1e-3,
+                 mu=0.95, k=5, rms_match_scale=0.2, weight_decay=0.1,
+                 adam_betas=(0.9, 0.999), adam_eps=1e-8):
+        
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= mu < 1.0:
+            raise ValueError(f"Invalid Muon mu (momentum): {mu}")
+        if not 1 <= k:
+            raise ValueError(f"Invalid Muon K (iterations): {k}")
+        if not 0.0 <= adam_betas[0] < 1.0:
+            raise ValueError(f"Invalid Adam beta1: {adam_betas[0]}")
+        if not 0.0 <= adam_betas[1] < 1.0:
+            raise ValueError(f"Invalid Adam beta2: {adam_betas[1]}")
+        if not 0.0 <= adam_eps:
+            raise ValueError(f"Invalid Adam epsilon: {adam_eps}")
+        if not 0.0 <= weight_decay:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+
+        # Muon-specific Newton-Schulz coefficients from paper [cite: 98]
+        self.a = 3.4445
+        self.b = -4.7750
+        self.c = 2.0315
+            
+        defaults = dict(
+            lr=lr, mu=mu, k=k, rms_match_scale=rms_match_scale,
+            weight_decay=weight_decay, adam_betas=adam_betas, adam_eps=adam_eps
+        )
+        super().__init__(params, defaults)
+
+    def _newton_schulz_ortho(self, M, K):
+        """
+        Computes the orthogonalized matrix O_t = X_N directly from M.
+        Implements Equation (2) from arXiv:2502.16982v1.
+        """
+        # Initialize X_0 = M_t / ||M_t||_F [cite: 92]
+        M_norm = torch.norm(M, 'fro') + 1e-12 # Add eps for stability
+        X = M / M_norm
+        
+        # Iterate K times 
+        for _ in range(K):
+            X_XT = X @ X.T
+            # Equation (2): X_k = a*X + b*(X*X^T)*X + c*(X*X^T)^2*X 
+            X = self.a * X + self.b * (X_XT @ X) + self.c * (X_XT @ X_XT @ X)
+        
+        return X # This is O_t
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            # Get group-level hyperparameters
+            lr = group['lr']
+            wd = group['weight_decay']
+            
+            # Adam fallback params
+            adam_beta1, adam_beta2 = group['adam_betas']
+            adam_eps = group['adam_eps']
+            
+            # Muon params
+            mu = group['mu']
+            k = group['k']
+            rms_scale = group['rms_match_scale']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError('Muon optimizer does not support sparse gradients.')
+
+                state = self.state[p]
+
+                # ==========================================================
+                # Case 1: 2D Matrix -> Apply Scalable Muon Logic (Eq. 4)
+                # ==========================================================
+                if p.dim() == 2:
+                    m, n = p.shape
+                    
+                    # Initialize Muon momentum state
+                    if 'momentum' not in state:
+                        state['momentum'] = torch.zeros_like(p)
+
+                    M = state['momentum']
+                    
+                    # 1. Update Momentum (Eq. 1): M_t = mu*M_t-1 + G_t 
+                    M.mul_(mu).add_(grad)
+
+                    # 2. Compute Orthogonalized Update O_t (Eq. 2)
+                    O_t = self._newton_schulz_ortho(M, k)
+                    
+                    # 3. Compute Final Scaled Update (Eq. 4)
+                    # Get dim scale: sqrt(max(A,B)) 
+                    dim_scale = math.sqrt(max(m, n))
+                    
+                    # W_t = W_t-1 - eta_t * (0.2 * O_t * sqrt(max(A,B)) + lambda * W_t-1) 
+                    # We implement this with DECOUPLED weight decay, as inspired by AdamW [cite: 110]
+                    
+                    # 3a. Apply decoupled weight decay
+                    if wd != 0:
+                        p.add_(p, alpha=-lr * wd)
+                    
+                    # 3b. Apply scaled Muon update
+                    # final_update = 0.2 * O_t * sqrt(max(A,B))
+                    final_update = (rms_scale * dim_scale) * O_t
+                    p.add_(final_update, alpha=-lr)
+
+                # ==========================================================
+                # Case 2: Other (e.g., 1D bias) -> Apply AdamW Logic
+                # ==========================================================
+                else:
+                    # Initialize Adam state
+                    if 'step' not in state:
+                        state['step'] = 0
+                        state['exp_avg'] = torch.zeros_like(p)
+                        state['exp_avg_sq'] = torch.zeros_like(p)
+
+                    state['step'] += 1
+                    step = state['step']
+                    exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+
+                    # AdamW: Decoupled Weight decay
+                    if wd != 0:
+                        p.add_(p, alpha=-lr * wd)
+
+                    # Adam: m_t
+                    exp_avg.mul_(adam_beta1).add_(grad, alpha=1.0 - adam_beta1)
+                    # Adam: v_t
+                    exp_avg_sq.mul_(adam_beta2).addcmul_(grad, grad, value=1.0 - adam_beta2)
+
+                    # Bias correction
+                    bias_correction1 = 1.0 - adam_beta1 ** step
+                    bias_correction2 = 1.0 - adam_beta2 ** step
+                    
+                    denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(adam_eps)
+                    step_size = lr / bias_correction1
+                    
+                    # Apply update
+                    p.addcdiv_(exp_avg, denom, value=-step_size)
+
+        return loss
+
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+# END: Muon Optimizer Implementation
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 
 def effective_rank(Z):
@@ -172,8 +338,37 @@ def make_gmm_task(rng, n=96, d=2, k=4, delta=3.0, spread=0.8, sigma=0.22, relabe
     return X[perm].astype(np.float64), y[perm].astype(np.float64)
 
 
+def get_optimizer(model_params, args):
+    """Helper function to create the selected optimizer."""
+    
+    opt_name = args.optimizer.lower()
+    
+    if opt_name == 'sgd':
+        # Pass weight decay to SGD
+        return optim.SGD(model_params, lr=args.lr, weight_decay=args.weight_decay)
+        
+    elif opt_name == 'adam':
+        # Use AdamW (which is what 'Adam' usually means in this context)
+        return optim.AdamW(model_params, lr=args.lr,
+                           betas=args.adam_betas,
+                           eps=args.adam_eps,
+                           weight_decay=args.weight_decay)
+                           
+    elif opt_name == 'muon':
+        # Use the new corrected Muon optimizer
+        return Muon(model_params, lr=args.lr,
+                    mu=args.muon_mu,
+                    k=args.muon_k,
+                    rms_match_scale=args.muon_rms_scale,
+                    weight_decay=args.weight_decay,
+                    adam_betas=args.adam_betas,
+                    adam_eps=args.adam_eps)
+    else:
+        raise ValueError(f"Unknown optimizer: {args.optimizer}")
+
+
 def run(args):
-    print(f"Using device: {device}")
+    print(f"Using device: {device}, Optimizer: {args.optimizer}")
     
     # Set seeds for reproducibility
     rng = np.random.default_rng(args.seed)
@@ -182,8 +377,9 @@ def run(args):
     # Use .double() to match original NumPy float64 precision
     net = MLP(d=args.d, h=args.h, L=args.L).to(device).double()
     
-    # Use standard SGD optimizer
-    optimizer = optim.SGD(net.parameters(), lr=args.lr)
+    # --- Create the selected optimizer ---
+    optimizer = get_optimizer(net.parameters(), args)
+    
     # Use stable BCEWithLogitsLoss (combines sigmoid + BCE)
     criterion = nn.BCEWithLogitsLoss()
 
@@ -238,8 +434,8 @@ def run(args):
             
             if s == 0:
                 g0 = math.sqrt(sum(p.grad.norm(2).item()**2 
-                                  for m in net.layers 
-                                  for p in m.parameters() if p.grad is not None))
+                                   for m in net.layers 
+                                   for p in m.parameters() if p.grad is not None))
             
             optimizer.step()
         
@@ -294,7 +490,8 @@ def run(args):
             
             # Create a fresh model and optimizer
             f_net = MLP(d=args.d, h=args.h, L=args.L).to(device).double()
-            f_opt = optim.SGD(f_net.parameters(), lr=args.lr) 
+            # --- Create the selected optimizer for the fresh network ---
+            f_opt = get_optimizer(f_net.parameters(), args)
             
             # Use fresh_steps for the fresh baseline
             for s in range(fresh_steps):
@@ -362,6 +559,10 @@ def run(args):
     # --- Save Plots (plotting all tasks) ---
     plt.style.use('ggplot') # Use a slightly nicer style for plots
     
+    # Create a directory for plots if it doesn't exist
+    import os
+    os.makedirs("out", exist_ok=True)
+    
     # Plot 1: min_CE
     fig1 = plt.figure(figsize=(10, 6))
     plt.plot(df["task"], df["min_CE"])
@@ -369,7 +570,7 @@ def run(args):
     plt.ylabel("min CE")
     plt.title("Per-task min CE")
     plt.grid(True)
-    fig1.savefig("lop_minCE.png", dpi=120)
+    fig1.savefig("out/lop_minCE.png", dpi=120)
     
     # Plot 2: Saturation
     fig2 = plt.figure(figsize=(10, 6))
@@ -378,7 +579,7 @@ def run(args):
     plt.ylabel("avg frac |z|>2")
     plt.title("Hidden saturation")
     plt.grid(True)
-    fig2.savefig("lop_sat.png", dpi=120)
+    fig2.savefig("out/lop_sat.png", dpi=120)
     
     # Plot 3: Grad Norm
     fig3 = plt.figure(figsize=(10, 6))
@@ -387,7 +588,7 @@ def run(args):
     plt.ylabel("||grad_hidden||")
     plt.title("Hidden grad norms (at step 0)")
     plt.grid(True)
-    fig3.savefig("lop_grad.png", dpi=120)
+    fig3.savefig("lop_grad.png", dpi=120) # Note: Original code saved this in root
     
     # Plot 4: final_CE
     fig4 = plt.figure(figsize=(10, 6))
@@ -396,7 +597,7 @@ def run(args):
     plt.ylabel("final CE")
     plt.title("Per-task final CE (at last step)")
     plt.grid(True)
-    fig4.savefig("lop_finalCE.png", dpi=120)
+    fig4.savefig("out/lop_finalCE.png", dpi=120)
     
     # Plot 5: Effective Rank
     fig5 = plt.figure(figsize=(10, 6))
@@ -410,9 +611,9 @@ def run(args):
     ax.set_title("Effective Rank of Hidden Layer Pre-Activations")
     ax.legend(title="Layer")
     ax.grid(True)
-    fig5.savefig("lop_effrank.png", dpi=120)
+    fig5.savefig("out/lop_effrank.png", dpi=120)
     
-    # Plot 6: Duplicate Fraction (NEW)
+    # Plot 6: Duplicate Fraction
     fig6 = plt.figure(figsize=(10, 6))
     ax = fig6.add_subplot(111)
     colors = plt.cm.plasma(np.linspace(0, 1, net.L)) # Use a different colormap
@@ -425,13 +626,15 @@ def run(args):
     ax.legend(title="Layer")
     ax.grid(True)
     ax.set_ylim(0, 1) # Fraction is always 0-1
-    fig6.savefig("lop_dup_frac.png", dpi=120)
+    fig6.savefig("out/lop_dup_frac.png", dpi=120)
     
-    print("Saved plots to lop_minCE.png, lop_sat.png, lop_grad.png, lop_finalCE.png, lop_effrank.png, lop_dup_frac.png")
+    print("Saved plots to 'out/' directory and 'lop_grad.png'")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
+    
+    # --- General ---
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--d", type=int, default=4, help="input dimension")
     ap.add_argument("--h", type=int, default=100, help="hidden layer dimension")
@@ -449,9 +652,37 @@ if __name__ == "__main__":
     ap.add_argument("--corr_thresh", type=float, default=0.95, help="Correlation threshold for duplicate features")
     ap.add_argument("--fresh_baseline", type=int, default=20, help="If >0, run a control group of fresh networks")
     
+    # --- Optimizer Selection ---
+    ap.add_argument("--optimizer", type=str, default="SGD",
+                    choices=["SGD", "Adam", "Muon"],
+                    help="Optimizer to use (SGD, Adam, Muon)")
+    
+    # --- Optimizer Hyperparameters (Shared) ---
+    ap.add_argument("--weight_decay", type=float, default=0.1, 
+                    help="Weight decay (lambda) for AdamW and Muon [cite: 286]")
+
+    # --- Muon-specific ---
+    ap.add_argument("--muon_mu", type=float, default=0.95, 
+                    help="Muon momentum mu ")
+    ap.add_argument("--muon_k", type=int, default=5, 
+                    help="Muon Newton-Schulz iterations (N) ")
+    ap.add_argument("--muon_rms_scale", type=float, default=0.2, 
+                    help="Muon RMS matching scale (e.g., 0.2) ")
+    
+    # --- Adam-specific (used by 'Adam' and 'Muon' fallback) ---
+    ap.add_argument("--adam_betas", type=float, nargs=2, default=[0.9, 0.999], 
+                    help="Adam betas")
+    ap.add_argument("--adam_eps", type=float, default=1e-8, 
+                    help="Adam epsilon")
+
     # These args are no longer used by the script but kept for compatibility
     ap.add_argument("--sat_bias", type=float, default=10.0)
     ap.add_argument("--sat_weight_scale", type=float, default=0.05)
     
     args = ap.parse_args()
+    
+    # A small fix from the original user code to ensure plots save to the 'out' dir
+    import os
+    os.makedirs("out", exist_ok=True)
+    
     run(args)

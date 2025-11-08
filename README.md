@@ -32,6 +32,12 @@ Custom configuration:
 python lop_fixed_regime.py --tasks 200 --h 100 --L 5 --lr 0.6 --steps 40
 ```
 
+**Example configuration that induces loss of plasticity:**
+```bash
+python lop_fixed_regime.py --steps 500 --lr 0.3 --tasks 300 --delta 0.0 --spread 1. --sigma 0.2 --k 4 --d 2 --L 10 --fresh_steps 500
+```
+*Note: This configuration demonstrates clear loss of plasticity behavior with high task count, deep network (10 layers), and overlapping task distributions (delta=0.0).*
+
 ## Key Parameters
 
 - `--tasks`: Number of sequential tasks (default: 100)
