@@ -553,7 +553,7 @@ def run(args):
     # Create DataFrame
     df = pd.DataFrame(df_data)
     
-    df.to_csv("lop_fixed_regime_results.csv", index=False)
+    df.to_csv("out/lop_fixed_regime_results.csv", index=False)
     print(f"\nSaved all {T_total} task results to lop_fixed_regime_results.csv")
 
     # --- Save Plots (plotting all tasks) ---
@@ -588,7 +588,7 @@ def run(args):
     plt.ylabel("||grad_hidden||")
     plt.title("Hidden grad norms (at step 0)")
     plt.grid(True)
-    fig3.savefig("lop_grad.png", dpi=120) # Note: Original code saved this in root
+    fig3.savefig("out/lop_grad.png", dpi=120) # Note: Original code saved this in root
     
     # Plot 4: final_CE
     fig4 = plt.figure(figsize=(10, 6))
@@ -658,8 +658,8 @@ if __name__ == "__main__":
                     help="Optimizer to use (SGD, Adam, Muon)")
     
     # --- Optimizer Hyperparameters (Shared) ---
-    ap.add_argument("--weight_decay", type=float, default=0.1, 
-                    help="Weight decay (lambda) for AdamW and Muon [cite: 286]")
+    ap.add_argument("--weight_decay", type=float, default=0.0, 
+                    help="Weight decay (lambda) for AdamW and Muon")
 
     # --- Muon-specific ---
     ap.add_argument("--muon_mu", type=float, default=0.95, 
