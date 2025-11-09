@@ -419,11 +419,11 @@ def run(args):
     # Initialize metric lists
     min_losses = []
     final_losses = []
-    sat = []
     gnorms = []
     # Use dicts to store layer-wise metrics
     eff_rank_data = {f'eff_rank_L{i}': [] for i in range(net.L)}
     dup_frac_data = {f'dup_frac_L{i}': [] for i in range(net.L)}
+    frozen_frac_data = {f'frozen_frac_L{i}': [] for i in range(net.L)}
 
     # --- Main Experiment Loop (Single Phase) ---
     total_tasks = args.tasks
@@ -470,11 +470,14 @@ def run(args):
         with torch.no_grad():
             _, _, Zs_final, As_final = net(X, capture=True)
 
-        # 1. Saturation (frozen activations: |f'(z)| < threshold)
-        mean_sat = torch.mean(
-            torch.stack([torch.mean((net.activation_derivative(Z) < args.frozen_thresh).double()) for Z in Zs_final])
-        ).item()
-        
+        # 1. Frozen Fraction (units with high probability of being frozen)
+        for i, Z in enumerate(Zs_final):
+            is_frozen = net.activation_derivative(Z) < args.frozen_thresh  # (batch, hidden_dim)
+            frozen_prob = torch.mean(is_frozen.double(), dim=0)  # (hidden_dim,) - probability of being frozen
+            is_frozen_unit = frozen_prob > args.frozen_p_thresh  # True if frozen on >= frozen_p_thresh of samples
+            frozen_frac = torch.mean(is_frozen_unit.double()).item()
+            frozen_frac_data[f'frozen_frac_L{i}'].append(frozen_frac)
+
         # 2. Effective Rank (on pre-activations Zs)
         for i, Z in enumerate(Zs_final):
             eff_rank = effective_rank(Z).item()
@@ -486,7 +489,6 @@ def run(args):
             dup_frac_data[f'dup_frac_L{i}'].append(dup_frac)
 
         # 4. Store other metrics
-        sat.append(mean_sat)
         gnorms.append(g0 if g0 is not None else 0.0)
         min_losses.append(min_ce)
         final_losses.append(final_ce)
@@ -541,14 +543,15 @@ def run(args):
         "median_min_CE": float(np.median(min_losses)),
         "mean_final_CE": float(np.mean(final_losses)),
         "median_final_CE": float(np.median(final_losses)),
-        "mean_saturation": float(np.mean(sat)),
         "mean_hidden_grad_norm": float(np.mean(gnorms)),
         "fresh_mean_final_CE_on_late": fresh_mean,
         "fresh_median_final_CE_on_late": fresh_median,
     }
-    
+
     # Add layer-wise metrics to results dict
     for i in range(net.L):
+        all_task_results[f'mean_frozen_frac_L{i}'] = float(np.mean(frozen_frac_data[f'frozen_frac_L{i}']))
+        all_task_results[f'median_frozen_frac_L{i}'] = float(np.median(frozen_frac_data[f'frozen_frac_L{i}']))
         all_task_results[f'mean_eff_rank_L{i}'] = float(np.mean(eff_rank_data[f'eff_rank_L{i}']))
         all_task_results[f'median_eff_rank_L{i}'] = float(np.median(eff_rank_data[f'eff_rank_L{i}']))
         all_task_results[f'mean_dup_frac_L{i}'] = float(np.mean(dup_frac_data[f'dup_frac_L{i}']))
@@ -562,14 +565,15 @@ def run(args):
     
     # Start with base metrics
     df_data = {
-        "task": np.arange(1, T_total + 1), 
+        "task": np.arange(1, T_total + 1),
         "min_CE": min_losses,
-        "final_CE": final_losses, 
-        "sat": sat, 
+        "final_CE": final_losses,
         "grad_norm": gnorms
     }
-    
+
     # Add layer-wise data to the dictionary
+    for i in range(net.L):
+        df_data[f'frozen_frac_L{i}'] = frozen_frac_data[f'frozen_frac_L{i}']
     for i in range(net.L):
         df_data[f'eff_rank_L{i}'] = eff_rank_data[f'eff_rank_L{i}']
     for i in range(net.L):
@@ -596,16 +600,21 @@ def run(args):
     plt.title("Per-task min CE")
     plt.grid(True)
     fig1.savefig("out/lop_minCE.png", dpi=120)
-    
-    # Plot 2: Saturation
+
+    # Plot 2: Frozen Fraction (per layer)
     fig2 = plt.figure(figsize=(10, 6))
-    plt.plot(df["task"], df["sat"])
-    plt.xlabel("Task")
-    plt.ylabel(f"|f'(z)| < {args.frozen_thresh}")
-    plt.title("Hidden saturation")
-    plt.grid(True)
-    fig2.savefig("out/lop_sat.png", dpi=120)
-    
+    ax = fig2.add_subplot(111)
+    colors = plt.cm.coolwarm(np.linspace(0, 1, net.L))
+    for i in range(net.L):
+        ax.plot(df["task"], df[f'frozen_frac_L{i}'], label=f'Layer {i}', color=colors[i], alpha=0.8)
+    ax.set_xlabel("Task")
+    ax.set_ylabel(f"Frozen Fraction (|f'(z)| < {args.frozen_thresh} on >{args.frozen_p_thresh*100:.0f}% samples)")
+    ax.set_title("Fraction of Frozen Units")
+    ax.legend(title="Layer")
+    ax.grid(True)
+    ax.set_ylim(0, 1)
+    fig2.savefig("out/lop_frozen.png", dpi=120)
+
     # Plot 3: Grad Norm
     fig3 = plt.figure(figsize=(10, 6))
     plt.plot(df["task"], df["grad_norm"])
@@ -669,6 +678,8 @@ if __name__ == "__main__":
                     help="Activation function to use")
     ap.add_argument("--frozen_thresh", type=float, default=0.05,
                     help="Threshold for frozen activations: |f'(z)| < threshold")
+    ap.add_argument("--frozen_p_thresh", type=float, default=0.98,
+                    help="Probability threshold: unit is frozen if frozen on > this fraction of samples")
     ap.add_argument("--n", type=int, default=96, help="points per task (batch size)")
     ap.add_argument("--k", type=int, default=4, help="number of Gaussian bumps")
     ap.add_argument("--lr", type=float, default=0.6, help="Fixed learning rate")
