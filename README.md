@@ -35,6 +35,7 @@ python lop_fixed_regime.py --tasks 200 --h 100 --L 5 --lr 0.6 --steps 40
 **Example configuration that induces loss of plasticity:**
 ```bash
 python lop_fixed_regime.py --steps 500 --lr 0.3 --tasks 100 --delta 0.0 --spread 1. --sigma 0.2  --k 5 --d 2 --L 10
+python lop_fixed_regime.py --steps 500 --lr 0.003 --tasks 100 --delta 0.0 --spread 1. --sigma 0.2  --k 5 --d 2 --L 10 --optimizer Adam
 ```
 
 **Example configurations with Muon optimizer that prevents loss of plasticity:**
@@ -43,8 +44,7 @@ python lop_fixed_regime.py --steps 500 --lr 0.3 --tasks 100 --delta 0.0 --spread
 python lop_fixed_regime.py  --steps 500 --lr 0.05 --tasks 100 --delta 0.0 --spread 1. --sigma 0.2  --k 5 --d 2 --L 10 --optimizer Muon --muon_k 5
 ```
 
-
-*Note: This configuration demonstrates clear loss of plasticity behavior with high task count, deep network (10 layers), and overlapping task distributions (delta=0.0).*
+*Note: the configurations above are largely the same, apart from the different learning rates, however,  learning rate for each config is derived based on the highest possible value that can effectively train. 
 
 ## Key Parameters
 
