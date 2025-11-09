@@ -1,6 +1,6 @@
-# Loss of Plasticity (LoP) Experiment
+# Loss of Plasticity (LoP) 
 
-PyTorch implementation for investigating loss of plasticity in continual learning with Gaussian Mixture Model (GMM) tasks.
+PyTorch implementation for investigating loss of plasticity in continual learning with Gaussian Mixture Model (GMM) tasks. The setup is designed for ultimate speed of producing and thereby studying loss of plasticty. 
 
 ## Overview
 
