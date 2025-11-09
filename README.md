@@ -34,8 +34,8 @@ python lop_fixed_regime.py --tasks 200 --h 100 --L 5 --lr 0.6 --steps 40
 
 **Example configuration that induces loss of plasticity:**
 ```bash
-python lop_fixed_regime.py --steps 500 --lr 0.3 --tasks 300 --delta 0.0 --spread 1. --sigma 0.2 --k 4 --d 2 --L 10 --fresh_steps 500
-python lop_fixed_regime.py       --steps 300     --lr 0.3     --tasks 100     --delta 0.0 --spread 1.     --sigma 0.2  --k 5 --d 2 --L 10
+python lop_fixed_regime.py --steps 500 --lr 0.3 --tasks 300 --delta 0.0 --spread 1. --sigma 0.2 --k 4 --d 2 --L 10 
+python lop_fixed_regime.py --steps 300 --lr 0.3 --tasks 100 --delta 0.0 --spread 1. --sigma 0.2  --k 5 --d 2 --L 10
 ```
 
 **Example configurations with Muon that prevents loss of plasticity:**
@@ -43,7 +43,7 @@ python lop_fixed_regime.py       --steps 300     --lr 0.3     --tasks 100     --
 Using Muon optimizer seems to prevent rank collapse and loss of plasticity: 
 
 ```bash
-python lop_fixed_regime.py       --steps 500     --lr 0.05     --tasks 100     --delta 0.0 --spread 1.     --sigma 0.2  --k 5 --d 2 --L 10 --optimizer Muon --muon_k 5
+python lop_fixed_regime.py  --steps 500 --lr 0.05 --tasks 100 --delta 0.0 --spread 1. --sigma 0.2  --k 5 --d 2 --L 10 --optimizer Muon --muon_k 5
 ```
 
 
