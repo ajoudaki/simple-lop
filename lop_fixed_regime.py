@@ -253,11 +253,24 @@ def fraction_duplicate_features(A, threshold=0.95):
 
 class MLP(nn.Module):
     """PyTorch MLP model"""
-    def __init__(self, d=2, h=100, L=5):
+    def __init__(self, d=2, h=100, L=5, activation='tanh'):
         super().__init__()
         self.L = L # Number of hidden layers
         self.h = h # Hidden dimension
-        
+
+        # Set activation function
+        activations = {
+            'relu': nn.ReLU(),
+            'selu': nn.SELU(),
+            'gelu': nn.GELU(),
+            'erf': lambda x: torch.erf(x),
+            'tanh': nn.Tanh()
+        }
+        if activation.lower() not in activations:
+            raise ValueError(f"Unknown activation: {activation}. Choose from {list(activations.keys())}")
+        self.activation = activations[activation.lower()]
+        self.activation_name = activation.lower()
+
         self.layers = nn.ModuleList()
         # Input layer
         self.layers.append(nn.Linear(d, h))
@@ -266,7 +279,7 @@ class MLP(nn.Module):
             self.layers.append(nn.Linear(h, h))
         # Output layer
         self.output_layer = nn.Linear(h, 1)
-        
+
         # Initialize weights
         self._init_weights()
 
@@ -277,6 +290,18 @@ class MLP(nn.Module):
                 init.xavier_normal_(m.weight)
                 init.constant_(m.bias, 0)
 
+    def activation_derivative(self, z):
+        """Compute |f'(z)| for the activation function."""
+        derivatives = {
+            'relu': lambda x: (x > 0).double(),
+            'selu': lambda x: torch.where(x > 0, torch.tensor(1.0507, device=x.device, dtype=x.dtype),
+                                         1.0507 * 1.67326 * torch.exp(x)),
+            'gelu': lambda x: torch.sigmoid(1.702 * x) * (1 + 1.702 * x * torch.sigmoid(1.702 * x) * (1 - torch.sigmoid(1.702 * x))),
+            'erf': lambda x: (2.0 / math.sqrt(math.pi)) * torch.exp(-x**2),
+            'tanh': lambda x: 1 - torch.tanh(x)**2
+        }
+        return torch.abs(derivatives[self.activation_name](z))
+
     def forward(self, X, capture=False):
         """
         Forward pass.
@@ -285,7 +310,7 @@ class MLP(nn.Module):
         if not capture:
             A = X
             for layer in self.layers:
-                A = torch.tanh(layer(A))
+                A = self.activation(layer(A))
             logits = self.output_layer(A)
             p = torch.sigmoid(logits)
             return p, logits
@@ -294,7 +319,7 @@ class MLP(nn.Module):
             A = X
             for layer in self.layers:
                 Z = layer(A)
-                A = torch.tanh(Z)
+                A = self.activation(Z)
                 Zs.append(Z)
                 As.append(A)
             logits = self.output_layer(A)
@@ -375,7 +400,7 @@ def run(args):
     torch.manual_seed(args.seed)
 
     # Use .double() to match original NumPy float64 precision
-    net = MLP(d=args.d, h=args.h, L=args.L).to(device).double()
+    net = MLP(d=args.d, h=args.h, L=args.L, activation=args.activation).to(device).double()
     
     # --- Create the selected optimizer ---
     optimizer = get_optimizer(net.parameters(), args)
@@ -445,9 +470,9 @@ def run(args):
         with torch.no_grad():
             _, _, Zs_final, As_final = net(X, capture=True)
 
-        # 1. Saturation
+        # 1. Saturation (frozen activations: |f'(z)| < threshold)
         mean_sat = torch.mean(
-            torch.stack([torch.mean((torch.abs(Z) > 2.0).double()) for Z in Zs_final])
+            torch.stack([torch.mean((net.activation_derivative(Z) < args.frozen_thresh).double()) for Z in Zs_final])
         ).item()
         
         # 2. Effective Rank (on pre-activations Zs)
@@ -489,7 +514,7 @@ def run(args):
             y = torch.from_numpy(y_np).to(device).double()
             
             # Create a fresh model and optimizer
-            f_net = MLP(d=args.d, h=args.h, L=args.L).to(device).double()
+            f_net = MLP(d=args.d, h=args.h, L=args.L, activation=args.activation).to(device).double()
             # --- Create the selected optimizer for the fresh network ---
             f_opt = get_optimizer(f_net.parameters(), args)
             
@@ -576,7 +601,7 @@ def run(args):
     fig2 = plt.figure(figsize=(10, 6))
     plt.plot(df["task"], df["sat"])
     plt.xlabel("Task")
-    plt.ylabel("avg frac |z|>2")
+    plt.ylabel(f"|f'(z)| < {args.frozen_thresh}")
     plt.title("Hidden saturation")
     plt.grid(True)
     fig2.savefig("out/lop_sat.png", dpi=120)
@@ -639,6 +664,11 @@ if __name__ == "__main__":
     ap.add_argument("--d", type=int, default=4, help="input dimension")
     ap.add_argument("--h", type=int, default=100, help="hidden layer dimension")
     ap.add_argument("--L", type=int, default=5, help="number of hidden layers")
+    ap.add_argument("--activation", type=str, default="tanh",
+                    choices=["relu", "selu", "gelu", "erf", "tanh"],
+                    help="Activation function to use")
+    ap.add_argument("--frozen_thresh", type=float, default=0.05,
+                    help="Threshold for frozen activations: |f'(z)| < threshold")
     ap.add_argument("--n", type=int, default=96, help="points per task (batch size)")
     ap.add_argument("--k", type=int, default=4, help="number of Gaussian bumps")
     ap.add_argument("--lr", type=float, default=0.6, help="Fixed learning rate")
