@@ -671,56 +671,64 @@ def run_hessian_analysis(model, loss_fn, x_batch, y_batch, args, save_name):
     Runs the full Lanczos + KPM pipeline to compute and save a plot
     of the Hessian eigenvalue density.
     """
-    print(f"  [Hessian] Analyzing state for: {save_name}")
-    try:
-        # 1. Get Spectral Bounds (min/max) using Lanczos
-        lanczos = LanczosHessian(model, loss_fn, device=device)
-        # Use .double() for all inputs to match model
-        lanczos_eigvals, _ = lanczos.run(x_batch.double(), y_batch.double(), k=args.lanczos_k)
-        
-        a = lanczos_eigvals.min().item()
-        b = lanczos_eigvals.max().item()
-        
-        # Add a 1% safety buffer to the bounds
-        buffer = (b - a) * 0.01
-        a -= buffer
-        b += buffer
+    print(f"  [Hessian] Analyzing state for: {save_name}")
 
-        # 2. Get Density (DoS) using KPM
-        kpm = KPMHessian(model, loss_fn, device=device)
-        kpm_moments = kpm.run(x_batch.double(), y_batch.double(), 
-                              M=args.kpm_moments, 
-                              R=args.kpm_vectors, 
-                              a=a, b=b)
-        
-        # 3. Reconstruct and Plot Density
-        x_grid = torch.linspace(a, b, 500, device=device, dtype=torch.double)
-        kpm_density = kpm.reconstruct_density(kpm_moments, x_grid, a, b)
-        
-        # 4. Create and Save Plot
-        plt.figure(figsize=(10, 6))
-        plt.plot(x_grid.cpu().detach().numpy(), 
-                 kpm_density.cpu().detach().numpy(), 
-                 color='red', 
-                 linewidth=2,
-                 label=f'KPM (M={args.kpm_moments}, R={args.kpm_vectors})')
-        plt.xlabel('Eigenvalue')
-        plt.ylabel('Density of States (DoS)')
-        plt.title(f'Hessian Eigenvalue Density - {save_name}')
-        plt.legend()
-        plt.ylim(bottom=0)
-        plt.grid(True, linestyle='--', alpha=0.5)
-        
-        plot_filename = f"out/hessian_plots/{save_name}.png"
-        plt.savefig(plot_filename, dpi=100)
-        plt.close() # Close figure to save memory
-        
-        print(f"    [Hessian] Saved plot to {plot_filename}")
+    # --- FIX: ADD TORCH.NO_GRAD() CONTEXT ---
+    # This entire analysis function should not track gradients.
+    # Disabling it prevents the massive memory leak.
+    with torch.no_grad():
+        try:
+            # 1. Get Spectral Bounds (min/max) using Lanczos
+            lanczos = LanczosHessian(model, loss_fn, device=device)
+            # Use .double() for all inputs to match model
+            lanczos_eigvals, _ = lanczos.run(x_batch.double(), y_batch.double(), k=args.lanczos_k)
+            
+            a = lanczos_eigvals.min().item()
+            b = lanczos_eigvals.max().item()
+            
+            # Add a 1% safety buffer to the bounds
+            buffer = (b - a) * 0.01
+            a -= buffer
+            b += buffer
 
-    except Exception as e:
-        print(f"    [Hessian] FAILED to compute Hessian for {save_name}. Error: {e}")
-        # Continue without crashing the main experiment
-        pass
+            # 2. Get Density (DoS) using KPM
+            kpm = KPMHessian(model, loss_fn, device=device)
+            kpm_moments = kpm.run(x_batch.double(), y_batch.double(), 
+                                    M=args.kpm_moments, 
+                                    R=args.kpm_vectors, 
+                                    a=a, b=b)
+            
+            # 3. Reconstruct and Plot Density
+            x_grid = torch.linspace(a, b, 500, device=device, dtype=torch.double)
+            kpm_density = kpm.reconstruct_density(kpm_moments, x_grid, a, b)
+            
+            # 4. Create and Save Plot
+            plt.figure(figsize=(10, 6))
+            plt.plot(x_grid.cpu().detach().numpy(), 
+                    kpm_density.cpu().detach().numpy(), 
+                    color='red', 
+                    linewidth=2,
+                    label=f'KPM (M={args.kpm_moments}, R={args.kpm_vectors})')
+            plt.xlabel('Eigenvalue')
+            plt.ylabel('Density of States (DoS)')
+            plt.title(f'Hessian Eigenvalue Density - {save_name}')
+            plt.legend()
+            # plt.ylim(bottom=0)
+            plt.yscale('log')
+            plt.grid(True, linestyle='--', alpha=0.5)
+            
+            plot_filename = f"out/hessian_plots/{save_name}.png"
+            plt.savefig(plot_filename, dpi=100)
+            plt.close() # Close figure to save memory
+            
+            print(f"    [Hessian] Saved plot to {plot_filename}")
+
+        except Exception as e:
+            print(f"    [Hessian] FAILED to compute Hessian for {save_name}. Error: {e}")
+            # Continue without crashing the main experiment
+            pass
+
+
 
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 # END: NEW Hessian Analysis Helper Function
