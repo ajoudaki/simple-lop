@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.func import functional_call, jvp, grad
+import torchvision
+import torchvision.transforms as transforms
 import time
-import math
 
 # ==============================================================================
 # 1. Centralized Configuration
@@ -12,52 +13,103 @@ import math
 CONFIG = {
     # System
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "dtype": torch.float32,
     "seed": 42,
     
+    # Dataset Selection
+    # Options: 'dummy', 'mnist', 'cifar10', 'cifar100'
+    "dataset": "mnist", 
+    "num_samples": 2000,      # Batch size
+    "dummy_dim": 50,          
+    
     # Model Architecture
-    "input_dim": 20,
-    "hidden_dim": 1000,  # Increased as per your request
-    "output_dim": 1,
-    "num_samples": 1000,
+    "hidden_dim": 1000,
     
     # Cubic Regularization Hyperparameters
-    "M": 10.0,
-    "newton_tol": 1e-2,
-    "newton_max_iter": 20,
+    "M": 5.0,                 # Initial M (adaptive strategies exist, but fixed is fine for demo)
+    "newton_tol": 1e-3,
+    "newton_max_iter": 100,
     
     # MINRES Linear Solver Hyperparameters
-    "minres_tol": 1e-2,
-    "minres_max_iter": 200,
+    "minres_tol": 1e-4,
+    "minres_max_iter": 1000,
     
     # Training Loop
-    "epochs": 15,
-    "check_optimality": True,
+    "epochs": 20,
+    "check_optimality": False, 
 }
 
 # ==============================================================================
-# 2. MINRES Solver (Optimized for Memory)
+# 2. Data Preparation Function
+# ==============================================================================
+
+def prepare_data(name, num_samples, device, dummy_dim=20):
+    print(f"Preparing dataset: {name.upper()}...")
+    name = name.lower()
+    
+    if name == 'dummy':
+        input_dim = dummy_dim
+        output_dim = 1
+        X = torch.randn(num_samples, input_dim, device=device)
+        W_true = torch.randn(input_dim, 1, device=device)
+        y = torch.sin(X @ W_true) + 0.05 * torch.randn(num_samples, 1, device=device)
+        return X, y, input_dim, output_dim, 'mse'
+
+    # Transforms
+    transform_list = [transforms.ToTensor()]
+    
+    if name == 'mnist':
+        transform_list.append(transforms.Normalize((0.1307,), (0.3081,)))
+        dataset_cls = torchvision.datasets.MNIST
+        input_dim = 28 * 28
+        output_dim = 10
+    elif name == 'cifar10':
+        transform_list.append(transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)))
+        dataset_cls = torchvision.datasets.CIFAR10
+        input_dim = 3 * 32 * 32
+        output_dim = 10
+    elif name == 'cifar100':
+        transform_list.append(transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)))
+        dataset_cls = torchvision.datasets.CIFAR100
+        input_dim = 3 * 32 * 32
+        output_dim = 100
+    else:
+        raise ValueError(f"Unknown dataset: {name}")
+
+    transform = transforms.Compose(transform_list)
+    
+    # Load Dataset (Retry mechanism for stability)
+    try:
+        dataset = dataset_cls(root='./data', train=True, download=True, transform=transform)
+    except RuntimeError:
+        dataset = dataset_cls(root='./data', train=True, download=True, transform=transform)
+    
+    loader = torch.utils.data.DataLoader(dataset, batch_size=num_samples, shuffle=True)
+    iter_loader = iter(loader)
+    X, y = next(iter_loader)
+    
+    # Flatten X
+    X = X.view(num_samples, -1).to(device)
+    y = y.to(device)
+    
+    return X, y, input_dim, output_dim, 'cross_entropy'
+
+# ==============================================================================
+# 3. MINRES Solver (Memory Optimized)
 # ==============================================================================
 
 def minres_solver(matvec_op, b, x_init=None, tol=1e-5, max_iter=100):
-    """
-    Solves Ax = b using Matrix-Vector products.
-    Critically: Uses torch.no_grad() for vector updates to prevent graph explosion.
-    """
-    # Wrap the operator to ensure it runs with autograd enabled, 
-    # while the rest of MINRES runs in no_grad mode.
+    # Wrap operator to re-enable gradients only for the HVP calculation
     def A_op(v):
         with torch.enable_grad():
             return matvec_op(v)
 
     mv_count = 0
-    n = b.numel()
     
-    # Everything inside MINRES logic (linear algebra) should not build a graph
+    # Run the solver logic without tracking gradients for the iterative updates
     with torch.no_grad():
         if x_init is not None:
             x = x_init.clone()
-            r0 = b - A_op(x) # A_op will re-enable grad internally
+            r0 = b - A_op(x)
             mv_count += 1
         else:
             x = torch.zeros_like(b)
@@ -66,8 +118,7 @@ def minres_solver(matvec_op, b, x_init=None, tol=1e-5, max_iter=100):
         v = r0.clone()
         beta = torch.norm(v)
         
-        if beta < 1e-20:
-            return x, mv_count
+        if beta < 1e-20: return x, mv_count
             
         v = v / beta
         v_old = torch.zeros_like(v)
@@ -82,11 +133,11 @@ def minres_solver(matvec_op, b, x_init=None, tol=1e-5, max_iter=100):
         if norm_b == 0: norm_b = 1.0
         
         for k in range(max_iter):
-            # --- The only part that needs Autograd logic (internal to the func) ---
+            # HVP Call (Autograd enabled inside A_op)
             Av = A_op(v) 
             mv_count += 1
             
-            # --- The rest is pure linear algebra (no graph needed) ---
+            # Standard MINRES steps
             alpha = torch.dot(v, Av)
             v_next = Av - alpha * v - beta * v_old
             beta_next = torch.norm(v_next)
@@ -102,18 +153,12 @@ def minres_solver(matvec_op, b, x_init=None, tol=1e-5, max_iter=100):
                 
             eta = c_new * beta_1
             d = (v - gamma * w - s_old * beta * w_old) / r1
-            
-            # Update x
             x.add_(d, alpha=eta)
             
-            # Update scalars
             beta_1 = -s_new * beta_1
-            
-            # Shift vectors
             v_old.copy_(v)
             v.copy_(v_next.div_(beta_next))
             beta = beta_next
-            
             w_old.copy_(w)
             w.copy_(d)
             c_old, s_old = c, s
@@ -125,54 +170,34 @@ def minres_solver(matvec_op, b, x_init=None, tol=1e-5, max_iter=100):
     return x, mv_count
 
 # ==============================================================================
-# 3. Optimality Checker
+# 4. Optimality Check (Optional)
 # ==============================================================================
 
 def check_optimality(H_op_func, g, s_star, lam_star, M):
     print("\n   [Optimality Check]")
     with torch.no_grad():
-        # 1. Stationarity
         Hs = H_op_func(s_star)
-        shifted_lhs = Hs + lam_star * s_star
-        residual = torch.norm(shifted_lhs + g)
-        print(f"   1. Res Norm ||(H+lamI)s + g|| : {residual:.2e}")
-
-        # 2. Norm Condition
+        res = torch.norm(Hs + lam_star * s_star + g)
         norm_s = torch.norm(s_star)
-        target_lam = (M / 2.0) * norm_s
-        lam_err = abs(lam_star - target_lam)
-        print(f"   2. Lam Check |lam - M/2||s||| : {lam_err:.2e}")
-
-        # 3. PSD Check (Approximate)
-        print(f"   3. PSD Check (Estimating lambda_min)...")
-        min_observed = float('inf')
-        for _ in range(5):
-            v = torch.randn_like(g)
-            v /= torch.norm(v)
-            Hv = H_op_func(v)
-            val = torch.dot(v, Hv) + lam_star
-            if val < min_observed: min_observed = val.item()
-                
-        status = "PASS" if min_observed >= -1e-3 else "FAIL"
-        print(f"      Min Rayleigh Quote (approx) : {min_observed:.4e} -> {status}")
+        lam_diff = abs(lam_star - (M/2.0)*norm_s)
+        print(f"   1. Residual: {res:.2e} | 2. Lambda Check: {lam_diff:.2e}")
 
 # ==============================================================================
-# 4. Cubic Step Solver (Stateless & Memory Efficient)
+# 5. Cubic Regularization Step
 # ==============================================================================
 
-def cubic_regularized_step(model, params_flat, buffers, inputs, targets, config):
+def cubic_regularized_step(model, params_flat, buffers, inputs, targets, config, loss_type='mse'):
     
-    # --- 1. Define Stateless Functional Loss ---
-    # We pass params and buffers explicitly to functional_call
-    # This is the cleanest way to avoid memory leaks with torch.func
+    # --- 1. Setup Stateless Loss Wrapper ---
+    # We capture inputs, targets, and buffers in the closure so the function
+    # only takes 'p_flat' as an argument. This fixes the JVP tangent issue.
     
-    # Pre-compute shapes once to avoid doing it in the loop
     param_shapes = [p.shape for p in model.parameters()]
     param_numels = [p.numel() for p in model.parameters()]
     param_names = [n for n, _ in model.named_parameters()]
     
-    def compute_loss_stateless(p_flat, b_dict, x, y):
-        # Unflatten
+    def loss_wrt_params(p_flat):
+        # Reconstruct parameters from flat vector
         params_dict = {}
         idx = 0
         for i, name in enumerate(param_names):
@@ -181,43 +206,37 @@ def cubic_regularized_step(model, params_flat, buffers, inputs, targets, config)
             idx += length
             
         # Functional forward pass
-        out = functional_call(model, (params_dict, b_dict), (x,))
-        return F.mse_loss(out, y)
+        out = functional_call(model, (params_dict, buffers), (inputs,))
+        
+        if loss_type == 'mse':
+            return F.mse_loss(out, targets)
+        else:
+            return F.cross_entropy(out, targets)
 
-    # --- 2. Gradient & HVP Setup ---
+    # --- 2. Gradient & HVP ---
     
-    # Compute Gradient
-    # grad(func)(args) -> returns gradients with respect to arg 0 (p_flat)
-    grad_fn = grad(compute_loss_stateless, argnums=0)
-    grads = grad_fn(params_flat, buffers, inputs, targets)
+    # Compute Gradient (1st Order)
+    # grad(func) returns a function that takes the same args as func
+    grad_fn = grad(loss_wrt_params)
+    grads = grad_fn(params_flat)
     
-    # Define HVP using Forward-over-Reverse (JVP of Grad)
-    # This is the most efficient HVP method in PyTorch
+    # Define HVP (2nd Order)
+    # HVP is JVP of the Gradient function.
     def hvp(v):
-        # jvp(func, primals, tangents)
-        # We only want derivative w.r.t params_flat (first arg), so other tangents are zeros/None
-        # However, jvp expects a tangent for every primal argument.
-        
-        tangents = (v, {}, torch.zeros_like(inputs), torch.zeros_like(targets))
-        primals = (params_flat, buffers, inputs, targets)
-        
-        # jvp returns (output, output_tangent). We want output_tangent.
-        # The 'output' of grad_fn is the gradient. 
-        # The 'output_tangent' of grad_fn is H*v.
-        _, hv = jvp(grad_fn, primals, tangents)
+        # JVP(f, primals, tangents)
+        # Since loss_wrt_params only takes 1 arg (params_flat), 
+        # we only pass 1 primal and 1 tangent.
+        _, hv = jvp(grad_fn, (params_flat,), (v,))
         return hv
 
-    # --- 3. Cubic Subproblem (Newton on Lambda) ---
-    
+    # --- 3. Newton Solve for Lambda ---
     M = config["M"]
     g = grads
-    
     lam = 0.0
     s = torch.zeros_like(g)
     total_mv = 0
     
     for i in range(config["newton_max_iter"]):
-        
         def shifted_hvp(v):
             return hvp(v) + lam * v
         
@@ -233,36 +252,32 @@ def cubic_regularized_step(model, params_flat, buffers, inputs, targets, config)
         if abs(F_val) < config["newton_tol"]:
             break
             
-        # Solve (H + lam*I) y = s
+        # Solve (H + lam*I) y = s (for derivative of lambda)
         y, mv_y = minres_solver(shifted_hvp, s, x_init=None, 
                                 tol=config["minres_tol"], 
                                 max_iter=config["minres_max_iter"])
         total_mv += mv_y
         
         dot_sy = torch.dot(s, y)
-        term = (M / 2.0) * (dot_sy / (norm_s + 1e-8))
-        F_prime = 1.0 + term
+        F_prime = 1.0 + (M / 2.0) * (dot_sy / (norm_s + 1e-8))
         
-        denom = F_prime if F_prime > 1e-2 else 1.0
-        lam_new = lam - (F_val / denom)
-        
-        if isinstance(lam_new, torch.Tensor): lam_new = lam_new.item()
-        lam = max(0.0, lam_new)
+        # Safe Newton update
+        lam = max(0.0, float(lam - F_val / max(F_prime.item(), 1e-2)))
     
-    # --- 4. Diagnostics & Update ---
+    # --- 4. Update ---
     if config["check_optimality"]:
         check_optimality(hvp, g, s, lam, M)
         
     new_params_flat = params_flat + s
     
-    # Re-evaluate loss for reporting (cheap forward pass)
+    # Report Loss (using no_grad to be fast)
     with torch.no_grad():
-        loss_val = compute_loss_stateless(params_flat, buffers, inputs, targets)
+        loss_val = loss_wrt_params(params_flat)
     
     return new_params_flat, loss_val, total_mv
 
 # ==============================================================================
-# 5. Main Execution
+# 6. Main Execution
 # ==============================================================================
 
 def main():
@@ -271,53 +286,71 @@ def main():
     if CONFIG['device'] == 'cuda':
         torch.cuda.manual_seed(CONFIG['seed'])
         
-    # 1. Setup Data
-    X = torch.randn(CONFIG['num_samples'], CONFIG['input_dim']).to(CONFIG['device'])
-    W_true = torch.randn(CONFIG['input_dim'], 1).to(CONFIG['device'])
-    Y = torch.sin(X @ W_true) + 0.05 * torch.randn(CONFIG['num_samples'], 1).to(CONFIG['device'])
+    # 1. Prepare Data
+    X, y, in_dim, out_dim, loss_type = prepare_data(
+        CONFIG['dataset'], 
+        CONFIG['num_samples'], 
+        CONFIG['device'],
+        dummy_dim=CONFIG['dummy_dim']
+    )
     
-    # 2. Model
+    print(f"Data Shape: Input {X.shape}, Targets {y.shape}")
+    print(f"Task Type: {loss_type.upper()}")
+    
+    # 2. Initialize Model
     model = nn.Sequential(
-        nn.Linear(CONFIG['input_dim'], CONFIG['hidden_dim']),
+        nn.Linear(in_dim, CONFIG['hidden_dim']),
         nn.ReLU(),
         nn.Linear(CONFIG['hidden_dim'], CONFIG['hidden_dim']),
         nn.ReLU(),
-        nn.Linear(CONFIG['hidden_dim'], CONFIG['output_dim'])
+        nn.Linear(CONFIG['hidden_dim'], CONFIG['hidden_dim']),
+        nn.ReLU(),
+        nn.Linear(CONFIG['hidden_dim'], out_dim)
     ).to(CONFIG['device'])
     
-    # Flatten Params & Extract Buffers
-    params_list = list(model.parameters())
-    flat_params = torch.cat([p.view(-1) for p in params_list])
+    print(f"Model Initialized: MLP {in_dim} -> {CONFIG['hidden_dim']} -> {CONFIG['hidden_dim']} -> {out_dim}")
+    
+    flat_params = torch.cat([p.view(-1) for p in model.parameters()])
     buffers = dict(model.named_buffers())
     
+    print("-" * 65)
     print(f"{'Epoch':<5} | {'Loss':<12} | {'MatVecs':<8} | {'Time (s)'}")
-    print("-" * 45)
+    print("-" * 65)
     
     total_time = 0
     
+    # 3. Optimization Loop
     for epoch in range(CONFIG['epochs']):
         start_t = time.time()
         
-        # Perform Step
         new_flat_params, loss, mvs = cubic_regularized_step(
-            model, flat_params, buffers, X, Y, CONFIG
+            model, flat_params, buffers, X, y, CONFIG, loss_type
         )
         
         flat_params = new_flat_params
         
-        # Update PyTorch model params (for next iteration state tracking)
+        # Sync model (necessary if we want to check final accuracy using standard forward)
         idx = 0
         with torch.no_grad():
             for p in model.parameters():
-                numel = p.numel()
-                p.copy_(flat_params[idx:idx+numel].view(p.shape))
-                idx += numel
+                n = p.numel()
+                p.copy_(flat_params[idx:idx+n].view(p.shape))
+                idx += n
         
         end_t = time.time()
         dt = end_t - start_t
         total_time += dt
         
         print(f"{epoch:<5} | {loss.item():.6f}     | {mvs:<8} | {dt:.4f}")
+
+    # 4. Final Accuracy Check
+    if loss_type == 'cross_entropy':
+        with torch.no_grad():
+            logits = model(X)
+            preds = torch.argmax(logits, dim=1)
+            acc = (preds == y).float().mean()
+            print("-" * 65)
+            print(f"Final Training Accuracy: {acc.item()*100:.2f}%")
 
 if __name__ == "__main__":
     main()
