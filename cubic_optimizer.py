@@ -16,8 +16,8 @@ CONFIG = {
     "seed": 42,
     
     # Dataset
-    "dataset": "mnist", 
-    "num_samples": 2000,
+    "dataset": "cifar10", 
+    "num_samples": 5000,
     "dummy_dim": 50,          
     
     # Model
@@ -29,8 +29,8 @@ CONFIG = {
     "M_max": 1e4,            # Ceiling to prevent stalling
     "rho_accept": 0.1,       # Threshold to accept a step
     "rho_great": 0.7,        # Threshold to decrease M (trust region expands)
-    "scale_up": 2.0,         # Factor to increase M
-    "scale_down": 0.5,       # Factor to decrease M
+    "scale_up": 2,         # Factor to increase M
+    "scale_down": 0.9,       # Factor to decrease M
     
     # Inner Solver (Newton/MINRES)
     "newton_tol": 1e-3,
@@ -39,7 +39,7 @@ CONFIG = {
     "minres_max_iter": 1000,
     
     # Training
-    "epochs": 20,
+    "epochs": 40,
     "check_optimality": False, 
 }
 
