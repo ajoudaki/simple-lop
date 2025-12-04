@@ -13,6 +13,8 @@ import torch.optim as optim
 import torch.nn.init as init
 from torch.optim.optimizer import Optimizer
 
+from checkpoints import CheckpointManager, OutputManager
+
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -284,11 +286,14 @@ class MLP(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Apply Xavier (Glorot) normal initialization."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                init.xavier_normal_(m.weight)
+                if self.activation_name == 'relu':
+                    init.kaiming_normal_(m.weight, nonlinearity='relu')
+                else:
+                    init.xavier_normal_(m.weight)
                 init.constant_(m.bias, 0)
+                
 
     def activation_derivative(self, z):
         """Compute |f'(z)| for the activation function."""
@@ -399,6 +404,18 @@ def run(args):
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
 
+    # Initialize output manager (creates run directory and saves config)
+    output_manager = OutputManager(args=args, base_dir="out")
+    
+    # Initialize checkpoint manager (uses same run_id for consistency)
+    ckpt_manager = CheckpointManager(
+        args=args,
+        checkpoint_freq=args.checkpoint_freq,
+        base_dir="model_checkpoints",
+        enabled=args.checkpoint_freq > 0,
+        run_id=output_manager.get_run_id()
+    )
+
     # Use .double() to match original NumPy float64 precision
     net = MLP(d=args.d, h=args.h, L=args.L, activation=args.activation).to(device).double()
     
@@ -456,6 +473,16 @@ def run(args):
                 final_ce = ce
                 
             loss.backward()
+            
+            # Save checkpoint if at the right step
+            if ckpt_manager.should_checkpoint(s):
+                ckpt_manager.save(
+                    model=net,
+                    task_idx=t,
+                    step_idx=s,
+                    save_gradients=True,
+                    additional_info={"loss": ce, "min_ce": min_ce}
+                )
             
             if s == 0:
                 g0 = math.sqrt(sum(p.grad.norm(2).item()**2 
@@ -559,6 +586,10 @@ def run(args):
     
     print("\n--- Results (all tasks) ---")
     print(json.dumps(all_task_results, indent=2))
+    
+    # Save results JSON
+    with open(output_manager.get_path("results.json"), 'w') as f:
+        json.dump(all_task_results, f, indent=2)
 
     # --- Save CSV with all tasks and new eff_rank columns ---
     T_total = args.tasks
@@ -582,15 +613,11 @@ def run(args):
     # Create DataFrame
     df = pd.DataFrame(df_data)
     
-    df.to_csv("out/lop_fixed_regime_results.csv", index=False)
-    print(f"\nSaved all {T_total} task results to lop_fixed_regime_results.csv")
+    df.to_csv(output_manager.get_path("lop_fixed_regime_results.csv"), index=False)
+    print(f"\nSaved all {T_total} task results to {output_manager.get_path('lop_fixed_regime_results.csv')}")
 
     # --- Save Plots (plotting all tasks) ---
     plt.style.use('ggplot') # Use a slightly nicer style for plots
-    
-    # Create a directory for plots if it doesn't exist
-    import os
-    os.makedirs("out", exist_ok=True)
     
     # Plot 1: min_CE
     fig1 = plt.figure(figsize=(10, 6))
@@ -599,7 +626,7 @@ def run(args):
     plt.ylabel("min CE")
     plt.title("Per-task min CE")
     plt.grid(True)
-    fig1.savefig("out/lop_minCE.png", dpi=120)
+    fig1.savefig(output_manager.get_path("lop_minCE.png"), dpi=120)
 
     # Plot 2: Frozen Fraction (per layer)
     fig2 = plt.figure(figsize=(10, 6))
@@ -613,7 +640,7 @@ def run(args):
     ax.legend(title="Layer")
     ax.grid(True)
     ax.set_ylim(0, 1)
-    fig2.savefig("out/lop_frozen.png", dpi=120)
+    fig2.savefig(output_manager.get_path("lop_frozen.png"), dpi=120)
 
     # Plot 3: Grad Norm
     fig3 = plt.figure(figsize=(10, 6))
@@ -622,7 +649,7 @@ def run(args):
     plt.ylabel("||grad_hidden||")
     plt.title("Hidden grad norms (at step 0)")
     plt.grid(True)
-    fig3.savefig("out/lop_grad.png", dpi=120) # Note: Original code saved this in root
+    fig3.savefig(output_manager.get_path("lop_grad.png"), dpi=120)
     
     # Plot 4: final_CE
     fig4 = plt.figure(figsize=(10, 6))
@@ -631,7 +658,7 @@ def run(args):
     plt.ylabel("final CE")
     plt.title("Per-task final CE (at last step)")
     plt.grid(True)
-    fig4.savefig("out/lop_finalCE.png", dpi=120)
+    fig4.savefig(output_manager.get_path("lop_finalCE.png"), dpi=120)
     
     # Plot 5: Effective Rank
     fig5 = plt.figure(figsize=(10, 6))
@@ -645,12 +672,12 @@ def run(args):
     ax.set_title("Effective Rank of Hidden Layer Pre-Activations")
     ax.legend(title="Layer")
     ax.grid(True)
-    fig5.savefig("out/lop_effrank.png", dpi=120)
+    fig5.savefig(output_manager.get_path("lop_effrank.png"), dpi=120)
     
     # Plot 6: Duplicate Fraction
     fig6 = plt.figure(figsize=(10, 6))
     ax = fig6.add_subplot(111)
-    colors = plt.cm.plasma(np.linspace(0, 1, net.L)) # Use a different colormap
+    colors = plt.cm.plasma(np.linspace(0, 1, net.L))
     for i in range(net.L):
         ax.plot(df["task"], df[f'dup_frac_L{i}'], label=f'Layer {i}', color=colors[i], alpha=0.8)
     
@@ -659,10 +686,10 @@ def run(args):
     ax.set_title("Duplicate Features (Post-Activation)")
     ax.legend(title="Layer")
     ax.grid(True)
-    ax.set_ylim(0, 1) # Fraction is always 0-1
-    fig6.savefig("out/lop_dup_frac.png", dpi=120)
+    ax.set_ylim(0, 1)
+    fig6.savefig(output_manager.get_path("lop_dup_frac.png"), dpi=120)
     
-    print("Saved plots to 'out/' directory and 'lop_grad.png'")
+    print(f"Saved plots to '{output_manager.get_output_dir()}/'")
 
 
 if __name__ == "__main__":
@@ -715,15 +742,15 @@ if __name__ == "__main__":
                     help="Adam betas")
     ap.add_argument("--adam_eps", type=float, default=1e-8, 
                     help="Adam epsilon")
+    
+    # --- Checkpointing ---
+    ap.add_argument("--checkpoint_freq", type=int, default=0,
+                    help="Save checkpoint every N steps (0 = disabled)")
 
     # These args are no longer used by the script but kept for compatibility
     ap.add_argument("--sat_bias", type=float, default=10.0)
     ap.add_argument("--sat_weight_scale", type=float, default=0.05)
     
     args = ap.parse_args()
-    
-    # A small fix from the original user code to ensure plots save to the 'out' dir
-    import os
-    os.makedirs("out", exist_ok=True)
     
     run(args)
