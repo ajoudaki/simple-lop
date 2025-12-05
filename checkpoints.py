@@ -13,7 +13,7 @@ def get_run_id(args: Any, prefix: str = "run") -> str:
     Generate a unique run identifier based on key config parameters and timestamp.
     """
     # Create a config string from key parameters
-    config_str = f"{args.optimizer}_lr{args.lr}_h{args.h}_L{args.L}_{args.activation}_tasks{args.tasks}_steps{args.steps}"
+    config_str = f"{args.optimizer}_lr{args.lr}_h{args.h}_L{args.L}_{args.activation}_tasks{args.tasks}_steps{args.steps}_bs{args.batch_size}"
     
     # Add a short hash for uniqueness
     config_hash = hashlib.md5(config_str.encode()).hexdigest()[:6]
