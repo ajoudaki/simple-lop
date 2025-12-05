@@ -6,6 +6,7 @@ import sys
 import time
 import json
 import pandas as pd
+import os
 
 import torch
 import torch.nn as nn
@@ -13,9 +14,6 @@ import torch.optim as optim
 import torch.nn.init as init
 import torch.nn.functional as F
 from torch.optim.optimizer import Optimizer
-
-from checkpoints import CheckpointManager, OutputManager
-from simple_dataloader import SimpleDataLoader
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -397,7 +395,14 @@ class ViT(BaseModel):
 # EXPERIMENT LOOP
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
-def make_gmm_task(rng, n=96, d=2, k=4, delta=3.0, spread=0.8, sigma=0.22, relabel_p=0.0):
+def make_gmm_task(rng, n=96, n_val=0, d=2, k=4, delta=3.0, spread=0.8, sigma=0.22, relabel_p=0.0):
+    """
+    Generates a GMM task.
+    Modified to optionally generate validation data (n_val) from the exact same
+    distribution (same centroids/rotations) as the training data.
+    """
+    total_n = n + n_val
+    
     th = float(rng.uniform(0, 2 * math.pi))
     u = np.array([math.cos(th), math.sin(th)])
     shift = rng.normal(0, 0.6, size=d)
@@ -409,18 +414,34 @@ def make_gmm_task(rng, n=96, d=2, k=4, delta=3.0, spread=0.8, sigma=0.22, relabe
         a1 = np.concatenate([a1, extra[1]])
     C0 = a0 + rng.normal(0, spread, size=(k, d))
     C1 = a1 + rng.normal(0, spread, size=(k, d))
+    
     def draw(nh, C):
+        if nh == 0: return np.empty((0, d))
         idx = rng.integers(0, len(C), size=nh)
         mu = C[idx]
         return mu + rng.normal(0, sigma, size=(nh, d))
-    nh = n // 2
-    X = np.vstack([draw(nh, C0), draw(nh, C1)])
-    y = np.vstack([np.zeros((nh, 1)), np.ones((nh, 1))])
+    
+    nh = total_n // 2
+    # If total_n is odd, the second class gets one more sample, but typically n is even.
+    nh1 = nh
+    nh2 = total_n - nh
+    
+    X = np.vstack([draw(nh1, C0), draw(nh2, C1)])
+    y = np.vstack([np.zeros((nh1, 1)), np.ones((nh2, 1))])
+    
     if relabel_p > 0.0:
-        flip = (rng.random(size=(n, 1)) < relabel_p).astype(float)
+        flip = (rng.random(size=(total_n, 1)) < relabel_p).astype(float)
         y = y * (1.0 - flip) + (1.0 - y) * flip
-    perm = rng.permutation(n)
-    return X[perm].astype(np.float64), y[perm].astype(np.float64)
+        
+    perm = rng.permutation(total_n)
+    X = X[perm].astype(np.float64)
+    y = y[perm].astype(np.float64)
+    
+    # Split into Train and Validation
+    X_train, y_train = X[:n], y[:n]
+    X_val, y_val = X[n:], y[n:]
+    
+    return X_train, y_train, X_val, y_val
 
 def get_optimizer(model_params, args):
     opt_name = args.optimizer.lower()
@@ -443,7 +464,7 @@ def get_model(args):
         'd': args.d, 'h': args.h, 'L': args.L, 
         'activation': args.activation,
         'use_bn': args.use_bn, 'use_ln': args.use_ln,
-        'affine': args.affine  # <--- Added affine argument here
+        'affine': args.affine
     }
     if args.model.lower() == 'mlp': return MLP(**common_kwargs)
     elif args.model.lower() == 'cnn': return CNN(**common_kwargs)
@@ -458,80 +479,73 @@ def run(args):
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
 
-    # Initialize output manager (creates run directory and saves config)
-    output_manager = OutputManager(args=args, base_dir="out")
-    
-    # Initialize checkpoint manager (uses same run_id for consistency)
-    ckpt_manager = CheckpointManager(
-        args=args,
-        checkpoint_freq=args.checkpoint_freq,
-        base_dir="model_checkpoints",
-        enabled=args.checkpoint_freq > 0,
-        run_id=output_manager.get_run_id()
-    )
-    
     net = get_model(args).to(device).double()
     optimizer = get_optimizer(net.parameters(), args)
     criterion = nn.BCEWithLogitsLoss()
 
-    steps, n = args.steps, args.n
+    steps, n, n_val = args.steps, args.n, args.n_val
     fresh_steps = args.fresh_steps if args.fresh_steps is not None else args.steps
-    batch_size = args.batch_size if args.batch_size is not None else n
 
     min_losses, final_losses, gnorms = [], [], []
+    # New lists for validation metrics
+    val_losses, val_accs = [], []
+    
     eff_rank_data = {f'eff_rank_L{i}': [] for i in range(net.L)}
     dup_frac_data = {f'dup_frac_L{i}': [] for i in range(net.L)}
     frozen_frac_data = {f'frozen_frac_L{i}': [] for i in range(net.L)}
 
-    print(f"Running {args.tasks} tasks (batch_size={batch_size})...")
+    print(f"Running {args.tasks} tasks...")
     
     for t in range(args.tasks):
-        X_np, y_np = make_gmm_task(rng, n=n, d=args.d, k=args.k,
-                                   delta=args.delta, spread=args.spread, 
-                                   sigma=args.sigma, relabel_p=args.relabel)
-        X = torch.from_numpy(X_np).to(device).double()
-        y = torch.from_numpy(y_np).to(device).double()
+        # Generate both training and validation set for this task
+        X_tr_np, y_tr_np, X_val_np, y_val_np = make_gmm_task(
+            rng, n=n, n_val=n_val, d=args.d, k=args.k,
+            delta=args.delta, spread=args.spread, 
+            sigma=args.sigma, relabel_p=args.relabel
+        )
+        
+        X = torch.from_numpy(X_tr_np).to(device).double()
+        y = torch.from_numpy(y_tr_np).to(device).double()
+        
+        # Validation tensors
+        X_val = torch.from_numpy(X_val_np).to(device).double()
+        y_val = torch.from_numpy(y_val_np).to(device).double()
 
         optimizer.state.clear()
         
-        dataloader = SimpleDataLoader(X, y, batch_size=batch_size, shuffle=True, rng=rng)
-        
         min_ce, final_ce, g0 = 1e9, 1e9, None
-        step_count = 0
         
-        for s in range(steps): # steps = epochs with batch_size < n
-            step_losses = []
-            for X_batch, y_batch in dataloader:
-                optimizer.zero_grad()
-                p, logits, Zs, As = net(X_batch, capture=True)
-                loss = criterion(logits, y_batch)
-                ce = loss.item()
-                step_losses.append(ce)
-                loss.backward()
-                if step_count == 0:
-                    g0 = math.sqrt(sum(p.grad.norm(2).item()**2 
-                                       for p in net.parameters() 
-                                       if p.grad is not None and p.requires_grad))
-                optimizer.step()
-                step_count += 1
-            
-            # Save checkpoint if at the right step
-            if ckpt_manager.should_checkpoint(s):
-                ckpt_manager.save(
-                    model=net,
-                    task_idx=t,
-                    step_idx=s,
-                    save_gradients=True,
-                    additional_info={"loss": ce, "min_ce": min_ce}
-                )
-            
-            step_ce = np.mean(step_losses)
-            min_ce = min(min_ce, step_ce)
-        final_ce = step_ce
+        for s in range(steps):
+            optimizer.zero_grad()
+            p, logits, Zs, As = net(X, capture=True)
+            loss = criterion(logits, y)
+            ce = loss.item()
+            min_ce = min(min_ce, ce)
+            if s == steps - 1: final_ce = ce
+            loss.backward()
+            if s == 0:
+                g0 = math.sqrt(sum(p.grad.norm(2).item()**2 
+                                   for p in net.parameters() 
+                                   if p.grad is not None and p.requires_grad))
+            optimizer.step()
         
-        # Metrics Calculation (use full batch for metrics)
+        # --- Metrics Calculation ---
         with torch.no_grad():
             _, _, Zs_final, As_final = net(X, capture=True)
+            
+            # --- Online Validation Evaluation ---
+            if n_val > 0:
+                _, logits_val = net(X_val, capture=False)
+                val_loss = criterion(logits_val, y_val).item()
+                # Binary Accuracy: logits > 0 implies sigmoid(logits) > 0.5
+                preds = (logits_val > 0).double()
+                acc = (preds == y_val).float().mean().item()
+                
+                val_losses.append(val_loss)
+                val_accs.append(acc)
+            else:
+                val_losses.append(0.0)
+                val_accs.append(0.0)
 
         for i, Z in enumerate(Zs_final):
             is_frozen = net.activation_derivative(Z) < args.frozen_thresh 
@@ -559,29 +573,24 @@ def run(args):
         print(f"Running {args.fresh_baseline} fresh baseline tasks (with {fresh_steps} steps)...")
         fresh_losses = []
         for t in range(args.fresh_baseline):
-            # Generate task using the same parameters from args
-            X_np, y_np = make_gmm_task(rng, n=n, d=args.d, k=args.k,
-                                       delta=args.delta, 
-                                       spread=args.spread, 
-                                       sigma=args.sigma, 
-                                       relabel_p=args.relabel)
+            X_tr_np, y_tr_np, _, _ = make_gmm_task(
+                rng, n=n, n_val=0, d=args.d, k=args.k,
+                delta=args.delta, spread=args.spread, 
+                sigma=args.sigma, relabel_p=args.relabel
+            )
             
-            X = torch.from_numpy(X_np).to(device).double()
-            y = torch.from_numpy(y_np).to(device).double()
+            X = torch.from_numpy(X_tr_np).to(device).double()
+            y = torch.from_numpy(y_tr_np).to(device).double()
             
-            dataloader = SimpleDataLoader(X, y, batch_size=batch_size, shuffle=True, rng=rng)
-            
-            # Create a fresh model and optimizer of the SAME selected type
             f_net = get_model(args).to(device).double()
             f_opt = get_optimizer(f_net.parameters(), args)
             
             for s in range(fresh_steps):
-                for X_batch, y_batch in dataloader:
-                    f_opt.zero_grad()
-                    _, f_logits = f_net(X_batch, capture=False)
-                    f_loss = criterion(f_logits, y_batch)
-                    f_loss.backward()
-                    f_opt.step()
+                f_opt.zero_grad()
+                _, f_logits = f_net(X, capture=False)
+                f_loss = criterion(f_logits, y)
+                f_loss.backward()
+                f_opt.step()
                 
             _, final_logits = f_net(X, capture=False)
             final_ce_fresh = criterion(final_logits, y).item()
@@ -597,6 +606,8 @@ def run(args):
         "mean_final_CE": float(np.mean(final_losses)),
         "median_min_CE": float(np.median(min_losses)),
         "median_final_CE": float(np.median(final_losses)),
+        "mean_val_CE": float(np.mean(val_losses)), # Added
+        "mean_val_Acc": float(np.mean(val_accs)),  # Added
         "mean_grad_norm": float(np.mean(gnorms)),
         "fresh_mean_final_CE": fresh_mean,
         "fresh_median_final_CE": fresh_median,
@@ -608,16 +619,14 @@ def run(args):
     
     print("\n--- Results Summary ---")
     print(json.dumps(all_task_results, indent=2))
-    
-    # Save results JSON
-    with open(output_manager.get_path("results.json"), 'w') as f:
-        json.dump(all_task_results, f, indent=2)
 
     # Save CSV
     df_data = {
         "task": np.arange(1, args.tasks + 1),
         "min_CE": min_losses,
         "final_CE": final_losses,
+        "val_CE": val_losses, # Added
+        "val_Acc": val_accs,  # Added
         "grad_norm": gnorms
     }
     for i in range(net.L):
@@ -626,15 +635,9 @@ def run(args):
         df_data[f'dup_frac_L{i}'] = dup_frac_data[f'dup_frac_L{i}']
         
     df = pd.DataFrame(df_data)
-    df.to_csv(output_manager.get_path("lop_results.csv"), index=False)
-    
-    df.to_csv(output_manager.get_path("lop_fixed_regime_results.csv"), index=False)
-
-    # --- Save Plots (plotting all tasks) ---
-    plt.style.use('ggplot') # Use a slightly nicer style for plots
+    df.to_csv("out/lop_results.csv", index=False)
     
     # Save Plots
-    import os
     os.makedirs("out", exist_ok=True)
     plt.style.use('ggplot')
     
@@ -644,7 +647,7 @@ def run(args):
     plt.xlabel("Task")
     plt.ylabel("Min CE")
     plt.title(f"Min CE ({args.model})")
-    plt.savefig(output_manager.get_path("lop_minCE.png"), dpi=120)
+    plt.savefig("out/lop_minCE.png", dpi=120)
     plt.close()
 
     # 2. Frozen Fraction
@@ -656,7 +659,7 @@ def run(args):
     plt.ylabel("Frozen Fraction")
     plt.legend()
     plt.title("Frozen Fraction")
-    plt.savefig(output_manager.get_path("lop_frozen_frac.png"), dpi=120)
+    plt.savefig("out/lop_frozen.png", dpi=120)
     plt.close()
     
     # 3. Effective Rank
@@ -668,7 +671,7 @@ def run(args):
     plt.ylabel("Effective Rank")
     plt.legend()
     plt.title("Effective Rank")
-    plt.savefig(output_manager.get_path("lop_eff_rank.png"), dpi=120)
+    plt.savefig("out/lop_effrank.png", dpi=120)
     plt.close()
 
     # 4. Final CE
@@ -677,7 +680,7 @@ def run(args):
     plt.xlabel("Task")
     plt.ylabel("Final CE")
     plt.title(f"Final CE ({args.model})")
-    plt.savefig(output_manager.get_path("lop_finalCE.png"), dpi=120)
+    plt.savefig("out/lop_finalCE.png", dpi=120)
     plt.close()
 
     # 5. Gradient Norm
@@ -686,7 +689,7 @@ def run(args):
     plt.xlabel("Task")
     plt.ylabel("Gradient Norm")
     plt.title(f"Gradient Norm (Step 0) ({args.model})")
-    plt.savefig(output_manager.get_path("lop_grad_norm.png"), dpi=120)
+    plt.savefig("out/lop_grad.png", dpi=120)
     plt.close()
 
     # 6. Duplicate Fraction
@@ -698,17 +701,34 @@ def run(args):
     plt.ylabel("Duplicate Fraction")
     plt.legend()
     plt.title("Duplicate Feature Fraction")
-    plt.savefig(output_manager.get_path("lop_dup_frac.png"), dpi=120)
+    plt.savefig("out/lop_dup_frac.png", dpi=120)
+    plt.close()
+
+    # 7. NEW: Validation Loss
+    plt.figure(figsize=(10, 6))
+    plt.plot(df["task"], df["val_CE"], color='tab:orange')
+    plt.xlabel("Task")
+    plt.ylabel("Online Validation CE")
+    plt.title(f"Online Validation CE ({args.model})")
+    plt.savefig("out/lop_val_loss.png", dpi=120)
+    plt.close()
+
+    # 8. NEW: Validation Accuracy
+    plt.figure(figsize=(10, 6))
+    plt.plot(df["task"], df["val_Acc"], color='tab:green')
+    plt.xlabel("Task")
+    plt.ylabel("Online Validation Accuracy")
+    plt.title(f"Online Validation Accuracy ({args.model})")
+    plt.savefig("out/lop_val_acc.png", dpi=120)
     plt.close()
     
-    print(f"Results and all 6 plots saved to {output_manager.output_dir}/")
+    print("Results and all 8 plots saved to out/")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, default="MLP", choices=["MLP", "CNN", "ResNet", "ViT"])
     ap.add_argument("--use_bn", action='store_true')
     ap.add_argument("--use_ln", action='store_true')
-    # ADDED ARGUMENT BELOW
     ap.add_argument("--affine", action='store_true', help="Enable learnable affine parameters in normalization layers")
     
     ap.add_argument("--seed", type=int, default=7)
@@ -719,6 +739,7 @@ if __name__ == "__main__":
     ap.add_argument("--frozen_thresh", type=float, default=0.05)
     ap.add_argument("--frozen_p_thresh", type=float, default=0.98)
     ap.add_argument("--n", type=int, default=300)
+    ap.add_argument("--n_val", type=int, default=100, help="Number of validation samples per task")
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--lr", type=float, default=0.6)
     ap.add_argument("--steps", type=int, default=40)
@@ -730,7 +751,6 @@ if __name__ == "__main__":
     ap.add_argument("--relabel", type=float, default=0.0)
     ap.add_argument("--corr_thresh", type=float, default=0.95)
     ap.add_argument("--fresh_baseline", type=int, default=10)
-    ap.add_argument("--batch_size", type=int, default=None, help="Batch size for training. Default is n (full batch).")
     
     ap.add_argument("--optimizer", type=str, default="SGD", choices=["SGD", "Adam", "Muon"])
     ap.add_argument("--weight_decay", type=float, default=0.0)
@@ -739,12 +759,7 @@ if __name__ == "__main__":
     ap.add_argument("--muon_rms_scale", type=float, default=0.2)
     ap.add_argument("--adam_betas", type=float, nargs=2, default=[0.9, 0.999])
     ap.add_argument("--adam_eps", type=float, default=1e-8)
-    
-    # --- Checkpointing ---
-    ap.add_argument("--checkpoint_freq", type=int, default=0,
-                    help="Save checkpoint every N steps (0 = disabled)")
 
     args = ap.parse_args()
-    import os
     os.makedirs("out", exist_ok=True)
     run(args)
