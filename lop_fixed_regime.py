@@ -13,6 +13,7 @@ import torch.optim as optim
 import torch.nn.init as init
 import torch.nn.functional as F
 from torch.optim.optimizer import Optimizer
+from torch.utils.data import TensorDataset, DataLoader
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -464,13 +465,14 @@ def run(args):
 
     steps, n = args.steps, args.n
     fresh_steps = args.fresh_steps if args.fresh_steps is not None else args.steps
+    batch_size = args.batch_size if args.batch_size is not None else n
 
     min_losses, final_losses, gnorms = [], [], []
     eff_rank_data = {f'eff_rank_L{i}': [] for i in range(net.L)}
     dup_frac_data = {f'dup_frac_L{i}': [] for i in range(net.L)}
     frozen_frac_data = {f'frozen_frac_L{i}': [] for i in range(net.L)}
 
-    print(f"Running {args.tasks} tasks...")
+    print(f"Running {args.tasks} tasks (batch_size={batch_size})...")
     
     for t in range(args.tasks):
         X_np, y_np = make_gmm_task(rng, n=n, d=args.d, k=args.k,
@@ -479,23 +481,29 @@ def run(args):
         X = torch.from_numpy(X_np).to(device).double()
         y = torch.from_numpy(y_np).to(device).double()
         
+        dataset = TensorDataset(X, y)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
         min_ce, final_ce, g0 = 1e9, 1e9, None
+        step_count = 0
         
         for s in range(steps):
-            optimizer.zero_grad()
-            p, logits, Zs, As = net(X, capture=True)
-            loss = criterion(logits, y)
-            ce = loss.item()
-            min_ce = min(min_ce, ce)
-            if s == steps - 1: final_ce = ce
-            loss.backward()
-            if s == 0:
-                g0 = math.sqrt(sum(p.grad.norm(2).item()**2 
-                                   for p in net.parameters() 
-                                   if p.grad is not None and p.requires_grad))
-            optimizer.step()
+            for X_batch, y_batch in dataloader:
+                optimizer.zero_grad()
+                p, logits, Zs, As = net(X_batch, capture=True)
+                loss = criterion(logits, y_batch)
+                ce = loss.item()
+                min_ce = min(min_ce, ce)
+                if s == steps - 1: final_ce = ce
+                loss.backward()
+                if step_count == 0:
+                    g0 = math.sqrt(sum(p.grad.norm(2).item()**2 
+                                       for p in net.parameters() 
+                                       if p.grad is not None and p.requires_grad))
+                optimizer.step()
+                step_count += 1
         
-        # Metrics Calculation
+        # Metrics Calculation (use full batch for metrics)
         with torch.no_grad():
             _, _, Zs_final, As_final = net(X, capture=True)
 
@@ -535,16 +543,20 @@ def run(args):
             X = torch.from_numpy(X_np).to(device).double()
             y = torch.from_numpy(y_np).to(device).double()
             
+            dataset = TensorDataset(X, y)
+            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            
             # Create a fresh model and optimizer of the SAME selected type
             f_net = get_model(args).to(device).double()
             f_opt = get_optimizer(f_net.parameters(), args)
             
             for s in range(fresh_steps):
-                f_opt.zero_grad()
-                _, f_logits = f_net(X, capture=False)
-                f_loss = criterion(f_logits, y)
-                f_loss.backward()
-                f_opt.step()
+                for X_batch, y_batch in dataloader:
+                    f_opt.zero_grad()
+                    _, f_logits = f_net(X_batch, capture=False)
+                    f_loss = criterion(f_logits, y_batch)
+                    f_loss.backward()
+                    f_opt.step()
                 
             _, final_logits = f_net(X, capture=False)
             final_ce_fresh = criterion(final_logits, y).item()
@@ -681,6 +693,7 @@ if __name__ == "__main__":
     ap.add_argument("--relabel", type=float, default=0.0)
     ap.add_argument("--corr_thresh", type=float, default=0.95)
     ap.add_argument("--fresh_baseline", type=int, default=10)
+    ap.add_argument("--batch_size", type=int, default=None, help="Batch size for training. Default is n (full batch).")
     
     ap.add_argument("--optimizer", type=str, default="SGD", choices=["SGD", "Adam", "Muon"])
     ap.add_argument("--weight_decay", type=float, default=0.0)
