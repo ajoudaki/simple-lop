@@ -13,7 +13,8 @@ import torch.optim as optim
 import torch.nn.init as init
 import torch.nn.functional as F
 from torch.optim.optimizer import Optimizer
-from torch.utils.data import TensorDataset, DataLoader
+
+from simple_dataloader import SimpleDataLoader
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -480,8 +481,7 @@ def run(args):
 
         optimizer.state.clear()
         
-        dataset = TensorDataset(X, y)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        dataloader = SimpleDataLoader(X, y, batch_size=batch_size, shuffle=True, rng=rng)
         
         min_ce, final_ce, g0 = 1e9, 1e9, None
         step_count = 0
@@ -545,8 +545,7 @@ def run(args):
             X = torch.from_numpy(X_np).to(device).double()
             y = torch.from_numpy(y_np).to(device).double()
             
-            dataset = TensorDataset(X, y)
-            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            dataloader = SimpleDataLoader(X, y, batch_size=batch_size, shuffle=True, rng=rng)
             
             # Create a fresh model and optimizer of the SAME selected type
             f_net = get_model(args).to(device).double()
