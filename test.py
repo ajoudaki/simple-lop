@@ -23,7 +23,7 @@ except ImportError:
 # Set the default device. Prioritize CUDA if available.
 try:
     if torch.cuda.is_available():
-        DEFAULT_DEVICE = "cuda:0"
+        DEFAULT_DEVICE = "cuda:1"
     else:
         DEFAULT_DEVICE = "cpu"
 except NameError:
@@ -753,7 +753,7 @@ if __name__ == "__main__":
 
     # --- Solver Specific Args ---
     ap.add_argument("--M", type=float, default=1.0, help="Cubic regularization parameter (M)")
-    ap.add_argument("--strategies", type=str, default="124", help="Strategies to run (e.g., '14' runs 1 and 4). Default: 124")
+    ap.add_argument("--strategies", type=str, default="1", help="Strategies to run (e.g., '14' runs 1 and 4). Default: 124")
     ap.add_argument("--lanczos_k", type=int, default=50,
                     help="Max Lanczos iterations (k) for Strategy 1")
     ap.add_argument("--max_cg", type=int, default=200,
