@@ -626,7 +626,7 @@ def run(args):
         df_data[f'dup_frac_L{i}'] = dup_frac_data[f'dup_frac_L{i}']
         
     df = pd.DataFrame(df_data)
-    df.to_csv("out/lop_results.csv", index=False)
+    df.to_csv(output_manager.get_path("lop_results.csv"), index=False)
     
     df.to_csv(output_manager.get_path("lop_fixed_regime_results.csv"), index=False)
 
@@ -701,7 +701,7 @@ def run(args):
     plt.savefig(output_manager.get_path("lop_dup_frac.png"), dpi=120)
     plt.close()
     
-    print("Results and all 6 plots saved to out/")
+    print(f"Results and all 6 plots saved to {output_manager.output_dir}/")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
