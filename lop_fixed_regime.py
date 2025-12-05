@@ -14,6 +14,7 @@ import torch.nn.init as init
 import torch.nn.functional as F
 from torch.optim.optimizer import Optimizer
 
+from checkpoints import CheckpointManager, OutputManager
 from simple_dataloader import SimpleDataLoader
 
 # Set device
@@ -457,6 +458,18 @@ def run(args):
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
 
+    # Initialize output manager (creates run directory and saves config)
+    output_manager = OutputManager(args=args, base_dir="out")
+    
+    # Initialize checkpoint manager (uses same run_id for consistency)
+    ckpt_manager = CheckpointManager(
+        args=args,
+        checkpoint_freq=args.checkpoint_freq,
+        base_dir="model_checkpoints",
+        enabled=args.checkpoint_freq > 0,
+        run_id=output_manager.get_run_id()
+    )
+    
     net = get_model(args).to(device).double()
     optimizer = get_optimizer(net.parameters(), args)
     criterion = nn.BCEWithLogitsLoss()
@@ -501,6 +514,17 @@ def run(args):
                                        if p.grad is not None and p.requires_grad))
                 optimizer.step()
                 step_count += 1
+            
+            # Save checkpoint if at the right step
+            if ckpt_manager.should_checkpoint(s):
+                ckpt_manager.save(
+                    model=net,
+                    task_idx=t,
+                    step_idx=s,
+                    save_gradients=True,
+                    additional_info={"loss": ce, "min_ce": min_ce}
+                )
+            
             step_ce = np.mean(step_losses)
             min_ce = min(min_ce, step_ce)
         final_ce = step_ce
@@ -584,6 +608,10 @@ def run(args):
     
     print("\n--- Results Summary ---")
     print(json.dumps(all_task_results, indent=2))
+    
+    # Save results JSON
+    with open(output_manager.get_path("results.json"), 'w') as f:
+        json.dump(all_task_results, f, indent=2)
 
     # Save CSV
     df_data = {
@@ -598,7 +626,12 @@ def run(args):
         df_data[f'dup_frac_L{i}'] = dup_frac_data[f'dup_frac_L{i}']
         
     df = pd.DataFrame(df_data)
-    df.to_csv("out/lop_results.csv", index=False)
+    df.to_csv(output_manager.get_path("lop_results.csv"), index=False)
+    
+    df.to_csv(output_manager.get_path("lop_fixed_regime_results.csv"), index=False)
+
+    # --- Save Plots (plotting all tasks) ---
+    plt.style.use('ggplot') # Use a slightly nicer style for plots
     
     # Save Plots
     import os
@@ -611,7 +644,7 @@ def run(args):
     plt.xlabel("Task")
     plt.ylabel("Min CE")
     plt.title(f"Min CE ({args.model})")
-    plt.savefig("out/lop_minCE.png", dpi=120)
+    plt.savefig(output_manager.get_path("lop_minCE.png"), dpi=120)
     plt.close()
 
     # 2. Frozen Fraction
@@ -623,7 +656,7 @@ def run(args):
     plt.ylabel("Frozen Fraction")
     plt.legend()
     plt.title("Frozen Fraction")
-    plt.savefig("out/lop_frozen.png", dpi=120)
+    plt.savefig(output_manager.get_path("lop_frozen_frac.png"), dpi=120)
     plt.close()
     
     # 3. Effective Rank
@@ -635,7 +668,7 @@ def run(args):
     plt.ylabel("Effective Rank")
     plt.legend()
     plt.title("Effective Rank")
-    plt.savefig("out/lop_effrank.png", dpi=120)
+    plt.savefig(output_manager.get_path("lop_eff_rank.png"), dpi=120)
     plt.close()
 
     # 4. Final CE
@@ -644,7 +677,7 @@ def run(args):
     plt.xlabel("Task")
     plt.ylabel("Final CE")
     plt.title(f"Final CE ({args.model})")
-    plt.savefig("out/lop_finalCE.png", dpi=120)
+    plt.savefig(output_manager.get_path("lop_finalCE.png"), dpi=120)
     plt.close()
 
     # 5. Gradient Norm
@@ -653,7 +686,7 @@ def run(args):
     plt.xlabel("Task")
     plt.ylabel("Gradient Norm")
     plt.title(f"Gradient Norm (Step 0) ({args.model})")
-    plt.savefig("out/lop_grad.png", dpi=120)
+    plt.savefig(output_manager.get_path("lop_grad_norm.png"), dpi=120)
     plt.close()
 
     # 6. Duplicate Fraction
@@ -665,10 +698,10 @@ def run(args):
     plt.ylabel("Duplicate Fraction")
     plt.legend()
     plt.title("Duplicate Feature Fraction")
-    plt.savefig("out/lop_dup_frac.png", dpi=120)
+    plt.savefig(output_manager.get_path("lop_dup_frac.png"), dpi=120)
     plt.close()
     
-    print("Results and all 6 plots saved to out/")
+    print(f"Results and all 6 plots saved to {output_manager.output_dir}/")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
@@ -706,6 +739,10 @@ if __name__ == "__main__":
     ap.add_argument("--muon_rms_scale", type=float, default=0.2)
     ap.add_argument("--adam_betas", type=float, nargs=2, default=[0.9, 0.999])
     ap.add_argument("--adam_eps", type=float, default=1e-8)
+    
+    # --- Checkpointing ---
+    ap.add_argument("--checkpoint_freq", type=int, default=0,
+                    help="Save checkpoint every N steps (0 = disabled)")
 
     args = ap.parse_args()
     import os
