@@ -98,7 +98,6 @@ class Muon(Optimizer):
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 def effective_rank(Z, eps=1e-10):
-    # Z should be (N_samples, D_features)
     Z_c = Z - Z.mean(dim=0, keepdim=True)
     C = (Z_c.T @ Z_c) / (max(1, Z.shape[0] - 1))
     C = C + eps * torch.eye(C.shape[0], device=C.device, dtype=C.dtype)
@@ -112,7 +111,6 @@ def effective_rank(Z, eps=1e-10):
     return torch.exp(entropy)
 
 def fraction_duplicate_features(A, threshold=0.95):
-    # A should be (N_samples, D_features)
     hidden_dim = A.shape[1]
     if hidden_dim == 0: return torch.tensor(0.0, device=A.device)
     corr_matrix = torch.corrcoef(A.T)
@@ -144,7 +142,7 @@ class BaseModel(nn.Module):
         derivatives = {
             'relu': lambda x: (x > 0).double(),
             'selu': lambda x: torch.where(x > 0, torch.tensor(1.0507, device=x.device, dtype=x.dtype),
-                                         1.0507 * 1.67326 * torch.exp(x)),
+                                          1.0507 * 1.67326 * torch.exp(x)),
             'gelu': lambda x: torch.sigmoid(1.702 * x) * (1 + 1.702 * x * torch.sigmoid(1.702 * x) * (1 - torch.sigmoid(1.702 * x))),
             'erf': lambda x: (2.0 / math.sqrt(math.pi)) * torch.exp(-x**2),
             'tanh': lambda x: 1 - torch.tanh(x)**2
@@ -156,30 +154,30 @@ class BaseModel(nn.Module):
             if isinstance(m, (nn.Linear, nn.Conv1d)):
                 init.xavier_normal_(m.weight)
                 if m.bias is not None: init.constant_(m.bias, 0)
-            elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm)):
+            elif isinstance(m, (nn.BatchNorm1d, nn.LayerNorm, nn.GroupNorm)):
                 if m.weight is not None: init.constant_(m.weight, 1)
                 if m.bias is not None: init.constant_(m.bias, 0)
 
 class MLP(BaseModel):
-    def __init__(self, d=2, h=100, L=5, activation='tanh', use_bn=False, use_ln=False):
+    def __init__(self, d=2, h=100, L=5, activation='tanh', use_bn=False, use_ln=False, affine=False):
         super().__init__(activation)
         self.L = L
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
         
         self.layers.append(nn.Linear(d, h))
-        self.norms.append(self._get_norm(h, use_bn, use_ln))
+        self.norms.append(self._get_norm(h, use_bn, use_ln, affine))
         
         for _ in range(L - 1):
             self.layers.append(nn.Linear(h, h))
-            self.norms.append(self._get_norm(h, use_bn, use_ln))
+            self.norms.append(self._get_norm(h, use_bn, use_ln, affine))
             
         self.output_layer = nn.Linear(h, 1)
         self._init_weights()
 
-    def _get_norm(self, dim, use_bn, use_ln):
-        if use_bn: return nn.BatchNorm1d(dim)
-        if use_ln: return nn.LayerNorm(dim)
+    def _get_norm(self, dim, use_bn, use_ln, affine):
+        if use_bn: return nn.BatchNorm1d(dim, affine=affine)
+        if use_ln: return nn.LayerNorm(dim, elementwise_affine=affine)
         return nn.Identity()
 
     def forward(self, X, capture=False):
@@ -200,27 +198,26 @@ class MLP(BaseModel):
 class CNN(BaseModel):
     """
     Standard 1D CNN. 
-    Metric flattening: (B, C, L) -> (B*L, C) so Channel is the feature.
     """
-    def __init__(self, d=2, h=100, L=5, activation='tanh', use_bn=False, use_ln=False):
+    def __init__(self, d=2, h=100, L=5, activation='tanh', use_bn=False, use_ln=False, affine=False):
         super().__init__(activation)
         self.L = L
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
         
         self.convs.append(nn.Conv1d(1, h, kernel_size=3, padding=1))
-        self.norms.append(self._get_norm(h, use_bn, use_ln))
+        self.norms.append(self._get_norm(h, use_bn, use_ln, affine))
         
         for _ in range(L - 1):
             self.convs.append(nn.Conv1d(h, h, kernel_size=3, padding=1))
-            self.norms.append(self._get_norm(h, use_bn, use_ln))
+            self.norms.append(self._get_norm(h, use_bn, use_ln, affine))
             
         self.fc = nn.Linear(h * d, 1)
         self._init_weights()
 
-    def _get_norm(self, dim, use_bn, use_ln):
-        if use_bn: return nn.BatchNorm1d(dim)
-        if use_ln: return nn.GroupNorm(1, dim) 
+    def _get_norm(self, dim, use_bn, use_ln, affine):
+        if use_bn: return nn.BatchNorm1d(dim, affine=affine)
+        if use_ln: return nn.GroupNorm(1, dim, affine=affine) 
         return nn.Identity()
 
     def forward(self, X, capture=False):
@@ -246,7 +243,6 @@ class CNN(BaseModel):
 class ResNet(BaseModel):
     """
     Standard ResNet.
-    Metric flattening: (B, C, L) -> (B*L, C).
     """
     class ResBlock(nn.Module):
         def __init__(self, h, activation_fn, norm_builder):
@@ -274,12 +270,13 @@ class ResNet(BaseModel):
                 
             return a_out
 
-    def __init__(self, d=2, h=100, L=5, activation='tanh', use_bn=False, use_ln=False):
+    def __init__(self, d=2, h=100, L=5, activation='tanh', use_bn=False, use_ln=False, affine=False):
         super().__init__(activation)
         self.L = L
         self.input_proj = nn.Linear(d, h) 
         self.blocks = nn.ModuleList()
-        norm_builder = lambda dim: self._get_norm(dim, use_bn, use_ln)
+        # Pass affine into the builder lambda
+        norm_builder = lambda dim: self._get_norm(dim, use_bn, use_ln, affine)
         
         for _ in range(L):
             self.blocks.append(self.ResBlock(h, self.activation_fn, norm_builder))
@@ -287,9 +284,9 @@ class ResNet(BaseModel):
         self.output_layer = nn.Linear(h, 1)
         self._init_weights()
 
-    def _get_norm(self, dim, use_bn, use_ln):
-        if use_bn: return nn.BatchNorm1d(dim)
-        if use_ln: return nn.GroupNorm(1, dim)
+    def _get_norm(self, dim, use_bn, use_ln, affine):
+        if use_bn: return nn.BatchNorm1d(dim, affine=affine)
+        if use_ln: return nn.GroupNorm(1, dim, affine=affine)
         return nn.Identity()
 
     def forward(self, X, capture=False):
@@ -310,9 +307,8 @@ class ResNet(BaseModel):
 class ViT(BaseModel):
     """
     Standard ViT.
-    Metric flattening: (B, L, D) -> (B*L, D).
     """
-    def __init__(self, d=2, h=100, L=5, activation='tanh', use_bn=False, use_ln=False):
+    def __init__(self, d=2, h=100, L=5, activation='tanh', use_bn=False, use_ln=False, affine=False):
         super().__init__(activation)
         self.L = L
         self.seq_len = 4 
@@ -322,31 +318,31 @@ class ViT(BaseModel):
         
         self.blocks = nn.ModuleList()
         for _ in range(L):
-            self.blocks.append(self.ViTBlock(self.embed_dim, self.activation_fn, use_bn, use_ln))
+            self.blocks.append(self.ViTBlock(self.embed_dim, self.activation_fn, use_bn, use_ln, affine))
             
-        self.norm = self._get_norm(self.embed_dim, use_bn, use_ln)
+        self.norm = self._get_norm(self.embed_dim, use_bn, use_ln, affine)
         self.head = nn.Linear(self.embed_dim, 1) 
         self._init_weights()
 
-    def _get_norm(self, dim, use_bn, use_ln):
-        if use_bn: return nn.BatchNorm1d(dim)
-        if use_ln: return nn.LayerNorm(dim)
+    def _get_norm(self, dim, use_bn, use_ln, affine):
+        if use_bn: return nn.BatchNorm1d(dim, affine=affine)
+        if use_ln: return nn.LayerNorm(dim, elementwise_affine=affine)
         return nn.Identity()
 
     class ViTBlock(nn.Module):
-        def __init__(self, dim, act, use_bn, use_ln):
+        def __init__(self, dim, act, use_bn, use_ln, affine):
             super().__init__()
             self.act = act
             self.use_bn = use_bn
-            self.norm1 = self._make_norm(dim, use_bn, use_ln)
-            self.norm2 = self._make_norm(dim, use_bn, use_ln)
+            self.norm1 = self._make_norm(dim, use_bn, use_ln, affine)
+            self.norm2 = self._make_norm(dim, use_bn, use_ln, affine)
             self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=4, batch_first=True)
             self.linear1 = nn.Linear(dim, dim * 4)
             self.linear2 = nn.Linear(dim * 4, dim)
 
-        def _make_norm(self, dim, use_bn, use_ln):
-            if use_bn: return nn.BatchNorm1d(dim)
-            if use_ln: return nn.LayerNorm(dim)
+        def _make_norm(self, dim, use_bn, use_ln, affine):
+            if use_bn: return nn.BatchNorm1d(dim, affine=affine)
+            if use_ln: return nn.LayerNorm(dim, elementwise_affine=affine)
             return nn.Identity()
             
         def _apply_norm(self, x, norm_layer):
@@ -444,7 +440,8 @@ def get_model(args):
     common_kwargs = {
         'd': args.d, 'h': args.h, 'L': args.L, 
         'activation': args.activation,
-        'use_bn': args.use_bn, 'use_ln': args.use_ln
+        'use_bn': args.use_bn, 'use_ln': args.use_ln,
+        'affine': args.affine  # <--- Added affine argument here
     }
     if args.model.lower() == 'mlp': return MLP(**common_kwargs)
     elif args.model.lower() == 'cnn': return CNN(**common_kwargs)
@@ -454,7 +451,7 @@ def get_model(args):
 
 def run(args):
     print(f"Device: {device} | Model: {args.model} | Opt: {args.optimizer}")
-    print(f"Conf: BN={args.use_bn} LN={args.use_ln} Act={args.activation}")
+    print(f"Conf: BN={args.use_bn} LN={args.use_ln} Affine={args.affine} Act={args.activation}")
     
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
@@ -480,6 +477,8 @@ def run(args):
                                    sigma=args.sigma, relabel_p=args.relabel)
         X = torch.from_numpy(X_np).to(device).double()
         y = torch.from_numpy(y_np).to(device).double()
+
+        optimizer.state.clear()
         
         dataset = TensorDataset(X, y)
         dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -674,6 +673,9 @@ if __name__ == "__main__":
     ap.add_argument("--model", type=str, default="MLP", choices=["MLP", "CNN", "ResNet", "ViT"])
     ap.add_argument("--use_bn", action='store_true')
     ap.add_argument("--use_ln", action='store_true')
+    # ADDED ARGUMENT BELOW
+    ap.add_argument("--affine", action='store_true', help="Enable learnable affine parameters in normalization layers")
+    
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--d", type=int, default=2)
     ap.add_argument("--h", type=int, default=100)
@@ -681,7 +683,7 @@ if __name__ == "__main__":
     ap.add_argument("--activation", type=str, default="tanh", choices=["relu", "selu", "gelu", "erf", "tanh"])
     ap.add_argument("--frozen_thresh", type=float, default=0.05)
     ap.add_argument("--frozen_p_thresh", type=float, default=0.98)
-    ap.add_argument("--n", type=int, default=200)
+    ap.add_argument("--n", type=int, default=300)
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--lr", type=float, default=0.6)
     ap.add_argument("--steps", type=int, default=40)
