@@ -196,9 +196,6 @@ class MLP(BaseModel):
         return p, logits
 
 class CNN(BaseModel):
-    """
-    Standard 1D CNN. 
-    """
     def __init__(self, d=2, h=100, L=5, activation='tanh', use_bn=False, use_ln=False, affine=False):
         super().__init__(activation)
         self.L = L
@@ -230,7 +227,6 @@ class CNN(BaseModel):
             A = self.activation_fn(Z)
             
             if capture:
-                # Flatten Batch*Length, Channel
                 Zs.append(Z.permute(0, 2, 1).reshape(-1, Z.shape[1]))
                 As.append(A.permute(0, 2, 1).reshape(-1, A.shape[1]))
                 
@@ -241,9 +237,6 @@ class CNN(BaseModel):
         return p, logits
 
 class ResNet(BaseModel):
-    """
-    Standard ResNet.
-    """
     class ResBlock(nn.Module):
         def __init__(self, h, activation_fn, norm_builder):
             super().__init__()
@@ -275,7 +268,6 @@ class ResNet(BaseModel):
         self.L = L
         self.input_proj = nn.Linear(d, h) 
         self.blocks = nn.ModuleList()
-        # Pass affine into the builder lambda
         norm_builder = lambda dim: self._get_norm(dim, use_bn, use_ln, affine)
         
         for _ in range(L):
@@ -305,9 +297,6 @@ class ResNet(BaseModel):
         return p, logits
 
 class ViT(BaseModel):
-    """
-    Standard ViT.
-    """
     def __init__(self, d=2, h=100, L=5, activation='tanh', use_bn=False, use_ln=False, affine=False):
         super().__init__(activation)
         self.L = L
@@ -363,7 +352,6 @@ class ViT(BaseModel):
             x = resid + self.linear2(a_mlp)
             
             if capture_list:
-                # Shape (B, Seq, Dim_hidden) -> (B*Seq, Dim_hidden)
                 D = z_mlp.shape[-1]
                 capture_list[0].append(z_mlp.reshape(-1, D))
                 capture_list[1].append(a_mlp.reshape(-1, D))
@@ -396,11 +384,6 @@ class ViT(BaseModel):
 # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 def make_gmm_task(rng, n=96, n_val=0, d=2, k=4, delta=3.0, spread=0.8, sigma=0.22, relabel_p=0.0):
-    """
-    Generates a GMM task.
-    Modified to optionally generate validation data (n_val) from the exact same
-    distribution (same centroids/rotations) as the training data.
-    """
     total_n = n + n_val
     
     th = float(rng.uniform(0, 2 * math.pi))
@@ -422,7 +405,6 @@ def make_gmm_task(rng, n=96, n_val=0, d=2, k=4, delta=3.0, spread=0.8, sigma=0.2
         return mu + rng.normal(0, sigma, size=(nh, d))
     
     nh = total_n // 2
-    # If total_n is odd, the second class gets one more sample, but typically n is even.
     nh1 = nh
     nh2 = total_n - nh
     
@@ -437,7 +419,6 @@ def make_gmm_task(rng, n=96, n_val=0, d=2, k=4, delta=3.0, spread=0.8, sigma=0.2
     X = X[perm].astype(np.float64)
     y = y[perm].astype(np.float64)
     
-    # Split into Train and Validation
     X_train, y_train = X[:n], y[:n]
     X_val, y_val = X[n:], y[n:]
     
@@ -475,6 +456,7 @@ def get_model(args):
 def run(args):
     print(f"Device: {device} | Model: {args.model} | Opt: {args.optimizer}")
     print(f"Conf: BN={args.use_bn} LN={args.use_ln} Affine={args.affine} Act={args.activation}")
+    print(f"Data: N={args.n} BatchSize={args.batch_size} Steps(Epochs)={args.steps}")
     
     rng = np.random.default_rng(args.seed)
     torch.manual_seed(args.seed)
@@ -484,10 +466,10 @@ def run(args):
     criterion = nn.BCEWithLogitsLoss()
 
     steps, n, n_val = args.steps, args.n, args.n_val
+    batch_size = args.batch_size
     fresh_steps = args.fresh_steps if args.fresh_steps is not None else args.steps
 
     min_losses, final_losses, gnorms = [], [], []
-    # New lists for validation metrics
     val_losses, val_accs = [], []
     
     eff_rank_data = {f'eff_rank_L{i}': [] for i in range(net.L)}
@@ -497,7 +479,6 @@ def run(args):
     print(f"Running {args.tasks} tasks...")
     
     for t in range(args.tasks):
-        # Generate both training and validation set for this task
         X_tr_np, y_tr_np, X_val_np, y_val_np = make_gmm_task(
             rng, n=n, n_val=n_val, d=args.d, k=args.k,
             delta=args.delta, spread=args.spread, 
@@ -507,7 +488,6 @@ def run(args):
         X = torch.from_numpy(X_tr_np).to(device).double()
         y = torch.from_numpy(y_tr_np).to(device).double()
         
-        # Validation tensors
         X_val = torch.from_numpy(X_val_np).to(device).double()
         y_val = torch.from_numpy(y_val_np).to(device).double()
 
@@ -515,21 +495,44 @@ def run(args):
         
         min_ce, final_ce, g0 = 1e9, 1e9, None
         
+        # 'steps' acts as Epochs here
         for s in range(steps):
-            optimizer.zero_grad()
-            p, logits, Zs, As = net(X, capture=True)
-            loss = criterion(logits, y)
-            ce = loss.item()
-            min_ce = min(min_ce, ce)
-            if s == steps - 1: final_ce = ce
-            loss.backward()
-            if s == 0:
-                g0 = math.sqrt(sum(p.grad.norm(2).item()**2 
-                                   for p in net.parameters() 
-                                   if p.grad is not None and p.requires_grad))
-            optimizer.step()
+            
+            # Shuffle indices for this epoch
+            perm = torch.randperm(n, device=device)
+            
+            # Mini-batch Loop
+            for start_idx in range(0, n, batch_size):
+                indices = perm[start_idx : start_idx + batch_size]
+                x_batch = X[indices]
+                y_batch = y[indices]
+                
+                optimizer.zero_grad()
+                
+                # FIXED UNPACKING HERE
+                p, logits_batch = net(x_batch, capture=False)
+                
+                loss = criterion(logits_batch, y_batch)
+                loss.backward()
+                
+                # Capture gradient norm on the very first batch of the first epoch
+                if s == 0 and start_idx == 0:
+                    g0 = math.sqrt(sum(p.grad.norm(2).item()**2 
+                                       for p in net.parameters() 
+                                       if p.grad is not None and p.requires_grad))
+                
+                optimizer.step()
+            
+            # At end of epoch, calculate Full Batch Loss for consistent metrics
+            with torch.no_grad():
+                # FIXED UNPACKING HERE AS WELL
+                _, logits_full = net(X, capture=False)
+                loss_full = criterion(logits_full, y)
+                ce = loss_full.item()
+                min_ce = min(min_ce, ce)
+                if s == steps - 1: final_ce = ce
         
-        # --- Metrics Calculation ---
+        # --- Metrics Calculation (Post Task) ---
         with torch.no_grad():
             _, _, Zs_final, As_final = net(X, capture=True)
             
@@ -537,7 +540,6 @@ def run(args):
             if n_val > 0:
                 _, logits_val = net(X_val, capture=False)
                 val_loss = criterion(logits_val, y_val).item()
-                # Binary Accuracy: logits > 0 implies sigmoid(logits) > 0.5
                 preds = (logits_val > 0).double()
                 acc = (preds == y_val).float().mean().item()
                 
@@ -570,7 +572,7 @@ def run(args):
     fresh_median = None 
     
     if args.fresh_baseline > 0:
-        print(f"Running {args.fresh_baseline} fresh baseline tasks (with {fresh_steps} steps)...")
+        print(f"Running {args.fresh_baseline} fresh baseline tasks (with {fresh_steps} epochs)...")
         fresh_losses = []
         for t in range(args.fresh_baseline):
             X_tr_np, y_tr_np, _, _ = make_gmm_task(
@@ -586,11 +588,19 @@ def run(args):
             f_opt = get_optimizer(f_net.parameters(), args)
             
             for s in range(fresh_steps):
-                f_opt.zero_grad()
-                _, f_logits = f_net(X, capture=False)
-                f_loss = criterion(f_logits, y)
-                f_loss.backward()
-                f_opt.step()
+                # Shuffle
+                perm = torch.randperm(n, device=device)
+                
+                for start_idx in range(0, n, batch_size):
+                    indices = perm[start_idx : start_idx + batch_size]
+                    x_batch = X[indices]
+                    y_batch = y[indices]
+                    
+                    f_opt.zero_grad()
+                    _, f_logits = f_net(x_batch, capture=False)
+                    f_loss = criterion(f_logits, y_batch)
+                    f_loss.backward()
+                    f_opt.step()
                 
             _, final_logits = f_net(X, capture=False)
             final_ce_fresh = criterion(final_logits, y).item()
@@ -606,8 +616,8 @@ def run(args):
         "mean_final_CE": float(np.mean(final_losses)),
         "median_min_CE": float(np.median(min_losses)),
         "median_final_CE": float(np.median(final_losses)),
-        "mean_val_CE": float(np.mean(val_losses)), # Added
-        "mean_val_Acc": float(np.mean(val_accs)),  # Added
+        "mean_val_CE": float(np.mean(val_losses)),
+        "mean_val_Acc": float(np.mean(val_accs)),
         "mean_grad_norm": float(np.mean(gnorms)),
         "fresh_mean_final_CE": fresh_mean,
         "fresh_median_final_CE": fresh_median,
@@ -625,8 +635,8 @@ def run(args):
         "task": np.arange(1, args.tasks + 1),
         "min_CE": min_losses,
         "final_CE": final_losses,
-        "val_CE": val_losses, # Added
-        "val_Acc": val_accs,  # Added
+        "val_CE": val_losses,
+        "val_Acc": val_accs,
         "grad_norm": gnorms
     }
     for i in range(net.L):
@@ -704,7 +714,7 @@ def run(args):
     plt.savefig("out/lop_dup_frac.png", dpi=120)
     plt.close()
 
-    # 7. NEW: Validation Loss
+    # 7. Validation Loss
     plt.figure(figsize=(10, 6))
     plt.plot(df["task"], df["val_CE"], color='tab:orange')
     plt.xlabel("Task")
@@ -713,7 +723,7 @@ def run(args):
     plt.savefig("out/lop_val_loss.png", dpi=120)
     plt.close()
 
-    # 8. NEW: Validation Accuracy
+    # 8. Validation Accuracy
     plt.figure(figsize=(10, 6))
     plt.plot(df["task"], df["val_Acc"], color='tab:green')
     plt.xlabel("Task")
@@ -738,7 +748,8 @@ if __name__ == "__main__":
     ap.add_argument("--activation", type=str, default="tanh", choices=["relu", "selu", "gelu", "erf", "tanh"])
     ap.add_argument("--frozen_thresh", type=float, default=0.05)
     ap.add_argument("--frozen_p_thresh", type=float, default=0.98)
-    ap.add_argument("--n", type=int, default=300)
+    ap.add_argument("--n", type=int, default=1000)
+    ap.add_argument("--batch_size", type=int, default=100)
     ap.add_argument("--n_val", type=int, default=100, help="Number of validation samples per task")
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--lr", type=float, default=0.6)
