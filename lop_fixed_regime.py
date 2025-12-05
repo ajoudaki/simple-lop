@@ -669,7 +669,7 @@ if __name__ == "__main__":
     ap.add_argument("--activation", type=str, default="tanh", choices=["relu", "selu", "gelu", "erf", "tanh"])
     ap.add_argument("--frozen_thresh", type=float, default=0.05)
     ap.add_argument("--frozen_p_thresh", type=float, default=0.98)
-    ap.add_argument("--n", type=int, default=96)
+    ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--lr", type=float, default=0.6)
     ap.add_argument("--steps", type=int, default=40)
