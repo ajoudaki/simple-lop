@@ -486,14 +486,14 @@ def run(args):
         min_ce, final_ce, g0 = 1e9, 1e9, None
         step_count = 0
         
-        for s in range(steps):
+        for s in range(steps): # steps = epochs with batch_size < n
+            step_losses = []
             for X_batch, y_batch in dataloader:
                 optimizer.zero_grad()
                 p, logits, Zs, As = net(X_batch, capture=True)
                 loss = criterion(logits, y_batch)
                 ce = loss.item()
-                min_ce = min(min_ce, ce)
-                if s == steps - 1: final_ce = ce
+                step_losses.append(ce)
                 loss.backward()
                 if step_count == 0:
                     g0 = math.sqrt(sum(p.grad.norm(2).item()**2 
@@ -501,6 +501,9 @@ def run(args):
                                        if p.grad is not None and p.requires_grad))
                 optimizer.step()
                 step_count += 1
+            step_ce = np.mean(step_losses)
+            min_ce = min(min_ce, step_ce)
+        final_ce = step_ce
         
         # Metrics Calculation (use full batch for metrics)
         with torch.no_grad():
