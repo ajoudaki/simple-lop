@@ -140,31 +140,6 @@ class BaseModel(nn.Module):
         self.activation_fn = self.activations_dict[activation.lower()]
         self.activation_name = activation.lower()
 
-<<<<<<< HEAD
-        self.layers = nn.ModuleList()
-        # Input layer
-        self.layers.append(nn.Linear(d, h))
-        # Hidden layers
-        for _ in range(L - 1):
-            self.layers.append(nn.Linear(h, h))
-        # Output layer
-        self.output_layer = nn.Linear(h, 1)
-
-        # Initialize weights
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                if self.activation_name == 'relu':
-                    init.kaiming_normal_(m.weight, nonlinearity='relu')
-                else:
-                    init.xavier_normal_(m.weight)
-                init.constant_(m.bias, 0)
-                
-
-=======
->>>>>>> main
     def activation_derivative(self, z):
         derivatives = {
             'relu': lambda x: (x > 0).double(),
